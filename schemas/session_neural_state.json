@@ -1,86 +1,13 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "SessionNeuralState",
-  "description": "Captured for every session for LAM training",
-  "type": "object",
-  "required": [
-    "session_id",
-    "site_id", 
-    "page_id",
-    "llm_provider",
-    "timestamp",
-    "dwell_time",
-    "max_scroll",
-    "interaction_count",
-    "cta_intent_score",
-    "conversion",
-    "revenue_value"
-  ],
-  "properties": {
-    "session_id": {
-      "type": "string",
-      "description": "Unique session identifier"
-    },
-    "site_id": {
-      "type": "string",
-      "description": "Site identifier"
-    },
-    "page_id": {
-      "type": "string",
-      "description": "Page variant identifier"
-    },
-    "llm_provider": {
-      "type": "string",
-      "description": "LLM provider used for this page"
-    },
-    "timestamp": {
-      "type": "string",
-      "format": "date-time",
-      "description": "ISO timestamp of session"
-    },
-    "dwell_time": {
-      "type": "number",
-      "minimum": 0,
-      "description": "Time on page in seconds"
-    },
-    "max_scroll": {
-      "type": "number",
-      "minimum": 0,
-      "maximum": 1,
-      "description": "Maximum scroll depth (0-1)"
-    },
-    "interaction_count": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Number of interactions (clicks, hovers, etc.)"
-    },
-    "cta_intent_score": {
-      "type": "number",
-      "minimum": 0,
-      "maximum": 1,
-      "description": "ML-predicted intent score"
-    },
-    "conversion": {
-      "type": "boolean",
-      "description": "Whether session converted"
-    },
-    "revenue_value": {
-      "type": "number",
-      "minimum": 0,
-      "description": "Revenue if converted"
-    }
-  },
-  "example": {
-    "session_id": "uuid",
-    "site_id": "site_123",
-    "page_id": "landing_v7",
-    "llm_provider": "anthropic_4_5",
-    "timestamp": "2025-09-18T14:12:00Z",
-    "dwell_time": 48.2,
-    "max_scroll": 0.81,
-    "interaction_count": 4,
-    "cta_intent_score": 0.72,
-    "conversion": true,
-    "revenue_value": 49.99
-  }
+  "session_id": "uuid",
+  "site_id": "site_123",
+  "page_id": "landing_v7",
+  "llm_provider": "anthropic_4_5",
+  "timestamp": "2025-09-18T14:12:00Z",
+  "dwell_time": 48.2,
+  "max_scroll": 0.81,
+  "interaction_count": 4,
+  "cta_intent_score": 0.72,
+  "conversion": true,
+  "revenue_value": 49.99
 }
