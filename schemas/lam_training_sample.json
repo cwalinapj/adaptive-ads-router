@@ -1,0 +1,47 @@
+{
+  "meta": {
+    "site_id": "site_123",
+    "category": "ecommerce",
+    "regime": "first-100",
+    "phase": "explore",
+    "timestamp": "2025-09-18T14:42:00Z"
+  },
+  "lineage": {
+    "parent_page_id": "landing_v7",
+    "child_page_id": "landing_v8",
+    "ghost_weight": 0.20,
+    "parent_lifetime_events": 142
+  },
+  "context_features": {
+    "traffic_source": "google_ads",
+    "device_type": "mobile",
+    "hour_of_day": 14,
+    "traffic_entropy": 0.48
+  },
+  "behavior_before": {
+    "mean_score": 1.12,
+    "bounce_rate": 0.48,
+    "avg_scroll": 0.51,
+    "avg_dwell_time": 38.1
+  },
+  "mutation_direction": {
+    "trust": 0.5,
+    "urgency": 0.2,
+    "friction": -0.1,
+    "visual_density": -0.3
+  },
+  "enforcement_distance": {
+    "dom_complexity": 0.18,
+    "semantic_drift": 0.14,
+    "visual_shift": 0.22
+  },
+  "outcome_after": {
+    "mean_score_delta": 0.14,
+    "conversion_delta": 0.003,
+    "bounce_delta": -0.06
+  },
+  "label": {
+    "success": true,
+    "failure_mode": null
+  }
+}
