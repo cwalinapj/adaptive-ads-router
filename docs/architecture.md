@@ -1,5 +1,13 @@
 # Architecture
 
+## Core Philosophy
+
+The system is lineage-aware.
+
+Pages do not reset; they evolve.
+Failures are preserved as tombstones.
+Sessions are preserved as neural DNA.
+
 ## System Overview
 
 ```
@@ -60,3 +68,17 @@
 | first_100 | 0-100 | 0.8 | Aggressive exploration |
 | middle | 100-1000 | 0.4 | Balanced |
 | neural | >1000 | 0.1 | Neural-guided |
+
+## Lineage
+
+Every page has ancestry. When a page dies:
+1. Tombstone captures the failure mode
+2. Successor inherits winning traits
+3. Ghost memory prevents repeat mistakes
+
+Every session leaves DNA:
+1. Behavioral signals (dwell, scroll, clicks)
+2. Intent scores
+3. Conversion outcomes
+
+The LAM learns from this accumulated wisdom.
