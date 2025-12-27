@@ -38,13 +38,24 @@ def now_iso():
 
 
 async def get_regime(site_id: str) -> str:
+    """
+    Fetch the current regime for a site from the router.
+
+    Falls back to 'first_100' on any error to ensure the system
+    remains operational even if the router is unavailable.
+    """
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"http://router:8024/stats/{site_id}", timeout=5.0)
             if resp.status_code == 200:
                 return resp.json().get("regime", "first_100")
-    except:
-        pass
+            print(f"[get_regime] Router returned status {resp.status_code} for site {site_id}")
+    except httpx.TimeoutException:
+        print(f"[get_regime] Timeout fetching regime for site {site_id}")
+    except httpx.RequestError as e:
+        print(f"[get_regime] Request error for site {site_id}: {e}")
+    except json.JSONDecodeError as e:
+        print(f"[get_regime] Invalid JSON response for site {site_id}: {e}")
     return "first_100"
 
 
