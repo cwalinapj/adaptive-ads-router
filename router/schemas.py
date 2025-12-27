@@ -1,7 +1,7 @@
 """Pydantic schemas for the Adaptive Ads Router."""
 
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List, Literal
+from typing import Any, Optional, Dict, List, Literal
 
 
 class SessionNeuralState(BaseModel):
@@ -77,7 +77,7 @@ class MutationDirection(BaseModel):
     site_id: str
     source_page_id: str
     target_page_id: str
-    changes: Dict[str, any] = {}
+    changes: Dict[str, Any] = {}
     diff_score: float = Field(ge=0, le=1)
     hypothesis: str
     expected_impact: Literal["positive", "negative", "neutral"]
