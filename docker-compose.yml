@@ -1,6 +1,29 @@
 version: "3.9"
 
 services:
+  # =============================================================================
+  # EDGE COMPOSER - Entry point for traffic, composes containers dynamically
+  # =============================================================================
+  edge:
+    build: ./edge
+    ports:
+      - "8040:8040"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ROUTER_URL=http://router:8024
+    depends_on:
+      - redis
+      - router
+    volumes:
+      # Bind Docker socket for container management
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Makefile for compose operations
+      - ./edge/Makefile:/app/Makefile:ro
+    restart: unless-stopped
+
+  # =============================================================================
+  # ROUTER - Thompson Sampling bandit for A/B routing
+  # =============================================================================
   router:
     build: ./router
     ports:
@@ -13,16 +36,24 @@ services:
       - redis
     restart: unless-stopped
 
+  # =============================================================================
+  # MCP - Container management and diff validation
+  # =============================================================================
   mcp:
     build: ./mcp
     ports:
       - "8030:8030"
     environment:
       - REDIS_URL=redis://redis:6379
+      - ROUTER_URL=http://router:8024
     depends_on:
       - redis
+      - router
     restart: unless-stopped
 
+  # =============================================================================
+  # REDIS - State storage for bandits, funnels, GTM events
+  # =============================================================================
   redis:
     image: redis:7-alpine
     ports:
@@ -34,3 +65,7 @@ services:
 
 volumes:
   redis-data:
+
+networks:
+  default:
+    name: adaptive-ads-router_default
