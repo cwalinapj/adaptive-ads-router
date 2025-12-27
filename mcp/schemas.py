@@ -1,7 +1,7 @@
 """Schemas for Docker MCP Service."""
 
 from pydantic import BaseModel
-from typing import Optional, Dict, List, Literal
+from typing import Any, Optional, Dict, List, Literal
 
 
 class ContainerInfo(BaseModel):
@@ -19,7 +19,7 @@ class CreateContainerRequest(BaseModel):
     page_id: str
     base_image: str = "nginx:alpine"
     html_content: Optional[str] = None
-    config: Dict[str, any] = {}
+    config: Dict[str, Any] = {}
 
 
 class CreateContainerResponse(BaseModel):
@@ -33,7 +33,7 @@ class DiffProposal(BaseModel):
     site_id: str
     source_page_id: str
     target_page_id: str
-    changes: Dict[str, any]
+    changes: Dict[str, Any]
     hypothesis: str
 
 

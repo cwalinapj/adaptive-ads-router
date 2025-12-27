@@ -15,8 +15,10 @@ class DiffEnforcer:
         return self._verify_required_elements(new_html)
     
     def _dom_complexity(self, a: str, b: str) -> float:
-        """Calculate DOM complexity difference."""
-        return abs(a.count("<") - b.count("<")) / max(a.count("<"), 1)
+        """Calculate DOM complexity difference (normalized 0-1)."""
+        a_tags = a.count("<")
+        b_tags = b.count("<")
+        return abs(a_tags - b_tags) / max(a_tags, b_tags, 1)
     
     def _verify_required_elements(self, html: str) -> bool:
         """Verify required elements are present."""
