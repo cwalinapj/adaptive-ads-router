@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Adaptive Ads Router | Turn Paid Clicks Into More Leads</title>
+    <meta
+      name="description"
+      content="Bandit-based landing page routing for Google Ads. Launch experiments fast, raise conversion rates, and reduce CAC."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="config.js"></script>
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <p class="eyebrow">Adaptive Ads Router</p>
+        <h1>Route every paid click to the landing page most likely to convert.</h1>
+        <p class="subhead">
+          Built for Google Ads operators who want measurable lead growth in weeks,
+          not another vague CRO report.
+        </p>
+        <div class="hero-cta">
+          <a class="button button-primary" href="https://cal.com/cwalinapj/adaptive-ads-router">Book A Call</a>
+          <a class="button button-secondary" href="https://github.com/cwalinapj/adaptive-ads-router">See The Repo</a>
+        </div>
+      </section>
+
+      <section class="proof">
+        <article class="proof-card">
+          <h2>What you get</h2>
+          <ul>
+            <li>Automated traffic allocation by observed conversion performance</li>
+            <li>Fast winner identification with Thompson Sampling confidence</li>
+            <li>Experiment guardrails that prevent unsafe page drift</li>
+          </ul>
+        </article>
+        <article class="proof-card">
+          <h2>Who this is for</h2>
+          <ul>
+            <li>Agencies managing paid campaigns across multiple landing pages</li>
+            <li>In-house growth teams spending $5k+ monthly on ads</li>
+            <li>B2B/B2C lead funnels where CAC and conversion rate are tracked</li>
+          </ul>
+        </article>
+      </section>
+
+      <section class="offers">
+        <h2>Engagement Options</h2>
+        <div class="offer-grid">
+          <article class="offer-card">
+            <p class="price">$2,500 fixed</p>
+            <h3>Paid setup + optimization package</h3>
+            <p>Instrumentation, deployment, baseline experiment setup, and first optimization sprint.</p>
+          </article>
+          <article class="offer-card">
+            <p class="price">$1,500/mo</p>
+            <h3>Managed experiment + weekly reporting</h3>
+            <p>Ongoing testing, bandit tuning, and weekly performance updates with actionable next steps.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="lead-box">
+        <h2>Get the rollout plan</h2>
+        <p>Submit details and get a same-day recommendation on where this can move conversion rate fastest.</p>
+        <form
+          id="lead-form"
+          class="lead-form"
+          action="https://formsubmit.co/replace-with-sales@yourdomain.com"
+          method="POST"
+        >
+          <input type="hidden" name="_subject" value="New Adaptive Ads Router lead" />
+          <input type="hidden" name="_captcha" value="false" />
+          <input type="text" name="_honey" class="hidden" tabindex="-1" autocomplete="off" />
+
+          <label>
+            Name
+            <input type="text" name="name" required />
+          </label>
+          <label>
+            Work email
+            <input type="email" name="email" required />
+          </label>
+          <label>
+            Monthly ad spend
+            <select name="monthly_ad_spend" required>
+              <option value="">Select one</option>
+              <option value="5k-10k">$5k-$10k</option>
+              <option value="10k-25k">$10k-$25k</option>
+              <option value="25k-100k">$25k-$100k</option>
+              <option value="100k+">$100k+</option>
+            </select>
+          </label>
+          <label>
+            Current goal
+            <textarea
+              name="goal"
+              rows="4"
+              placeholder="Example: increase booked calls by 20% while holding CAC."
+              required
+            ></textarea>
+          </label>
+
+          <button type="submit" class="button button-primary">Request rollout plan</button>
+          <p class="form-note">
+            Set your inbox in the form action URL to capture leads via FormSubmit.
+          </p>
+        </form>
+      </section>
+    </main>
+    <script>
+      (function applyLeadEmail() {
+        var form = document.getElementById("lead-form");
+        if (!form) return;
+        if (window.LEAD_EMAIL && window.LEAD_EMAIL.includes("@")) {
+          form.action = "https://formsubmit.co/" + window.LEAD_EMAIL;
+        }
+      })();
+    </script>
+  </body>
+</html>

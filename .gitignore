@@ -18,3 +18,4 @@ docker-compose.override.yml
 .coverage
 .DS_Store
 dump.rdb
+promo/Sitebuilder1.0/config.js
