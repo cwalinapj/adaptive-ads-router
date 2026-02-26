@@ -1,113 +1,90 @@
 # Adaptive Ads Router
 
-A high-velocity, container-based bandit system for Google Ads landing pages.
+Increase Google Ads lead volume and lower CAC by automatically routing paid traffic to higher-converting landing page variants.
 
-## Core Principles
+## Who This Is For
 
-- **One container per landing page** - Isolated testing environments
-- **One LLM governor per container** - First-100 regime control
-- **Divergence-gated evolution** - Changes require performance proof
-- **Container Diff Enforcement** - Prevents exploration drift
-- **Session-level neural ingestion** - For LAM distillation
+- Performance marketers and agencies spending $5k+/month on Google Ads
+- Teams running multiple landing pages but choosing winners too slowly
+- Founders who want a measurable path to higher ROAS, not design guesswork
 
-## Regimes
-
-| Regime | Sessions | Behavior |
-|--------|----------|----------|
-| **First-100** | 0-100 | Fast evolution, hard resets, LLM-gated |
-| **100-1000** | 100-1000 | Ghost-memory weighting |
-| **>1000** | 1000+ | Neural + LAM dominant |
-
-## Quick Start
+## 5-Minute Quickstart
 
 ```bash
-# Clone
 git clone https://github.com/cwalinapj/adaptive-ads-router.git
 cd adaptive-ads-router
-
-# Configure
 cp .env.example .env
-
-# Run
-docker-compose up -d
-
-# Test
+docker compose up -d --build
 curl http://localhost:8024/health
-curl http://localhost:8024/route/site123
 ```
 
-## Components
-
-### Router (Port 8024)
-
-FastAPI service that routes traffic to page variants using Thompson Sampling.
+## One-Command Demo (Sample Data)
 
 ```bash
-# Get routing decision
+./scripts/demo.sh
+```
+
+The demo starts the stack, runs simulated paid traffic, records conversions, and prints variant performance.
+
+Example output:
+
+```text
+=== Adaptive Ads Router Demo ===
+Router URL: http://localhost:8024
+Site ID: acme-demo
+Simulated sessions: 60
+Variant summary:
+  - acme-demo_page_a: sessions=34, conversions=6, cvr=17.65%
+  - acme-demo_page_b: sessions=26, conversions=5, cvr=19.23%
+Bandit winner: not yet declared
+Current regime: first_100
+Stats endpoint: http://localhost:8024/stats/acme-demo
+```
+
+## Paid Offers (Monetization CTA)
+
+### 1) Paid Setup + Optimization Package ($2,500 fixed)
+
+- Instrumentation + router setup
+- Initial experiment design and guardrails
+- One conversion-focused iteration sprint
+
+### 2) Managed Experiments + Weekly Reporting ($1,500/month)
+
+- Continuous test queue and variant rotation
+- Weekly performance report (CVR, CAC proxy, winner confidence)
+- Ongoing guardrail checks and execution support
+
+## Book A Call / DM
+
+- [Book a call](https://cal.com/cwalinapj/adaptive-ads-router)
+- [DM on X](https://x.com/cwalinapj)
+- [Landing page template](promo/Sitebuilder1.0/index.html)
+
+## API Snapshot
+
+Router service runs on `:8024`:
+
+```bash
 POST /route/{site_id}
-{
-  "visitor_id": "v123",
-  "device_type": "mobile"
-}
-
-# Record outcome
 POST /outcome
-{
-  "site_id": "site123",
-  "page_id": "page_a",
-  "converted": true,
-  "revenue": 49.99
-}
-
-# Ingest session neural state
 POST /session
-{
-  "session_id": "sess_123",
-  "site_id": "site123",
-  "page_id": "page_a",
-  "dwell_time": 45.2,
-  "max_scroll": 0.85,
-  "conversion": true
-}
+GET  /stats/{site_id}
+POST /validate-diff
+GET  /tombstones/{site_id}
+GET  /neural-data/{site_id}
 ```
 
-### Docker MCP (Port 8030)
+Docker MCP service runs on `:8030`.
 
-Container management and diff enforcement.
+## Core Model
 
-```bash
-# Validate container diff
-POST /validate
-{
-  "site_id": "site123",
-  "changes": {"cta_color": "#ff0000"},
-  "hypothesis": "Red CTA increases urgency"
-}
-
-# Create tombstone
-POST /tombstone?site_id=site123&page_id=page_a&successor_id=page_b
-```
-
-## Diff Enforcement
-
-Each regime has limits on what changes are allowed:
-
-| Regime | Max Diff Score | Allowed Changes |
-|--------|----------------|-----------------|
-| First-100 | 0.8 | CTA, headlines, hero, layout, forms |
-| Middle | 0.4 | CTA, headlines, testimonials |
-| Neural | 0.1 | CTA text, headlines only |
-
-**Always Forbidden:** logo, brand_colors, legal_text, pricing
-
-## Docker Images
-
-Docker images are automatically built and pushed to GitHub Container Registry:
-
-```bash
-ghcr.io/cwalinapj/adaptive-ads-router-router:latest
-ghcr.io/cwalinapj/adaptive-ads-router-mcp:latest
-```
+- Thompson Sampling routes visitors by posterior conversion probability
+- Regimes adjust behavior as volume grows:
+  - `first_100`: high exploration
+  - `middle`: reduced exploration
+  - `neural`: conservative, stability-focused
+- Diff enforcement restricts unsafe page changes by regime
 
 ## License
 
