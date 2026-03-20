@@ -11,6 +11,7 @@ import csv
 import secrets
 import asyncio
 import smtplib
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from io import StringIO
@@ -48,6 +49,7 @@ BanditType = Union[ThompsonSamplingBandit, ContextualBandit]
 # Redis client (global)
 redis_client = None
 report_scheduler_task = None
+report_worker_task = None
 
 
 def site_config_key(site_id: str) -> str:
@@ -66,12 +68,20 @@ def report_sent_week_key(site_id: str) -> str:
     return f"report_week_sent:{site_id}"
 
 
-def report_attempted_week_key(site_id: str) -> str:
-    return f"report_week_attempted:{site_id}"
-
-
 def last_report_payload_key(site_id: str) -> str:
     return f"report_payload_last:{site_id}"
+
+
+def report_jobs_queue_key() -> str:
+    return "report_jobs:queue"
+
+
+def report_jobs_dead_letter_key() -> str:
+    return "report_jobs:dead"
+
+
+def report_job_idempotency_key(site_id: str, week_id: str, mode: str) -> str:
+    return f"report_job:idem:{site_id}:{week_id}:{mode}"
 
 
 def build_default_site_config(site_id: str) -> dict:
@@ -466,34 +476,20 @@ def report_window_is_open(config: dict) -> tuple[bool, str]:
     )
 
 
-async def deliver_weekly_report(site_id: str, site_config: dict) -> None:
-    await send_weekly_report(
-        site_id=site_id,
-        site_config=site_config,
-        report_email=site_config.get("report_email"),
-        enforce_schedule_window=True,
-        skip_if_attempted=True,
-    )
+def current_week_id(config: dict) -> str:
+    return datetime.now(ZoneInfo(config["report_timezone"])).strftime("%G-W%V")
 
 
 async def send_weekly_report(
     site_id: str,
     site_config: dict,
     report_email: Optional[str],
-    enforce_schedule_window: bool,
-    skip_if_attempted: bool,
+    week_id: Optional[str] = None,
 ) -> dict:
     if not report_email:
         return {"status": "skipped", "reason": "report_email is not configured"}
     config = app.state.config
-    window_open, week_id = report_window_is_open(config)
-    if enforce_schedule_window and not window_open:
-        return {"status": "skipped", "reason": "outside delivery window", "week_id": week_id}
-
-    last_sent_week = await redis_client.get(report_sent_week_key(site_id))
-    last_attempt_week = await redis_client.get(report_attempted_week_key(site_id))
-    if skip_if_attempted and (last_sent_week == week_id or last_attempt_week == week_id):
-        return {"status": "skipped", "reason": "already attempted this week", "week_id": week_id}
+    week_id = week_id or current_week_id(config)
 
     token = site_config.get("owner_token", "")
     report = await build_weekly_summary(site_id, site_config)
@@ -525,7 +521,6 @@ async def send_weekly_report(
     try:
         await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
         await redis_client.set(report_sent_week_key(site_id), week_id)
-        await redis_client.set(report_attempted_week_key(site_id), week_id)
         await append_delivery_log(site_id, {
             "status": "sent",
             "week_id": week_id,
@@ -534,7 +529,6 @@ async def send_weekly_report(
         })
         return {"status": "sent", "week_id": week_id, "report_email": report_email}
     except Exception as exc:
-        await redis_client.set(report_attempted_week_key(site_id), week_id)
         await append_delivery_log(site_id, {
             "status": "failed",
             "week_id": week_id,
@@ -544,12 +538,8 @@ async def send_weekly_report(
         return {"status": "failed", "week_id": week_id, "report_email": report_email, "error": str(exc)}
 
 
-async def resend_last_report_payload(site_id: str) -> dict:
+async def resend_report_payload(site_id: str, payload: dict) -> dict:
     config = app.state.config
-    payload = await get_last_report_payload(site_id)
-    if not payload:
-        return {"status": "failed", "error": "No previously generated report payload found"}
-
     report_email = payload.get("report_email")
     subject = payload.get("subject")
     html_body = payload.get("html_body")
@@ -593,15 +583,164 @@ async def resend_last_report_payload(site_id: str) -> dict:
         }
 
 
+async def resend_last_report_payload(site_id: str) -> dict:
+    payload = await get_last_report_payload(site_id)
+    if not payload:
+        return {"status": "failed", "error": "No previously generated report payload found"}
+    return await resend_report_payload(site_id, payload)
+
+
+async def enqueue_report_job(
+    site_id: str,
+    mode: Literal["scheduled", "test", "resend"],
+    week_id: str,
+    source: str,
+    report_email: Optional[str] = None,
+    payload: Optional[dict] = None,
+    enforce_idempotency: bool = True,
+) -> dict:
+    config = app.state.config
+    idempotency_key = report_job_idempotency_key(site_id, week_id, mode)
+    job = {
+        "job_id": str(uuid.uuid4()),
+        "site_id": site_id,
+        "mode": mode,
+        "week_id": week_id,
+        "source": source,
+        "report_email": report_email,
+        "payload": payload,
+        "attempts": 0,
+        "max_attempts": config["report_job_max_attempts"],
+        "created_at": now_iso(),
+        "idempotency_key": idempotency_key,
+    }
+    if enforce_idempotency:
+        created = await redis_client.set(
+            idempotency_key,
+            job["job_id"],
+            ex=config["report_idempotency_ttl_seconds"],
+            nx=True,
+        )
+        if not created:
+            return {
+                "status": "duplicate",
+                "reason": "idempotency key already exists",
+                "idempotency_key": idempotency_key,
+                "week_id": week_id,
+                "mode": mode,
+            }
+    await redis_client.lpush(report_jobs_queue_key(), json.dumps(job))
+    return {"status": "queued", "job": job}
+
+
+async def requeue_report_job_with_delay(job: dict, delay_seconds: int) -> None:
+    await asyncio.sleep(max(1, delay_seconds))
+    await redis_client.lpush(report_jobs_queue_key(), json.dumps(job))
+
+
+async def process_report_job(job: dict) -> None:
+    site_id = job["site_id"]
+    mode = job["mode"]
+    week_id = job["week_id"]
+    attempts = int(job.get("attempts", 0))
+    max_attempts = int(job.get("max_attempts", app.state.config["report_job_max_attempts"]))
+    site_config = await get_existing_site_config(site_id)
+    if not site_config:
+        await append_delivery_log(site_id, {
+            "status": "failed",
+            "mode": mode,
+            "week_id": week_id,
+            "error": "Site not found while processing queued job",
+            "job_id": job["job_id"],
+        })
+        await redis_client.rpush(report_jobs_dead_letter_key(), json.dumps(job))
+        return
+
+    if mode == "resend":
+        payload = job.get("payload") or await get_last_report_payload(site_id)
+        if not payload:
+            result = {"status": "failed", "error": "No previously generated report payload found"}
+        else:
+            result = await resend_report_payload(site_id, payload)
+    else:
+        result = await send_weekly_report(
+            site_id=site_id,
+            site_config=site_config,
+            report_email=job.get("report_email") or site_config.get("report_email"),
+            week_id=week_id,
+        )
+        result["mode"] = mode
+
+    if result.get("status") in {"sent", "skipped"}:
+        log_event("report_job_processed", {
+            "job_id": job["job_id"],
+            "site_id": site_id,
+            "mode": mode,
+            "status": result.get("status"),
+            "week_id": week_id,
+        })
+        return
+
+    attempts += 1
+    job["attempts"] = attempts
+    if attempts < max_attempts:
+        backoff = app.state.config["report_job_backoff_seconds"] * (2 ** (attempts - 1))
+        log_event("report_job_retry_scheduled", {
+            "job_id": job["job_id"],
+            "site_id": site_id,
+            "mode": mode,
+            "attempts": attempts,
+            "next_delay_seconds": backoff,
+            "error": result.get("error"),
+        })
+        asyncio.create_task(requeue_report_job_with_delay(job, backoff))
+        return
+
+    dead = {
+        **job,
+        "dead_lettered_at": now_iso(),
+        "last_error": result.get("error"),
+    }
+    await redis_client.rpush(report_jobs_dead_letter_key(), json.dumps(dead))
+    await append_delivery_log(site_id, {
+        "status": "failed",
+        "mode": mode,
+        "week_id": week_id,
+        "report_email": job.get("report_email"),
+        "error": result.get("error", "unknown error"),
+        "dead_lettered": True,
+        "attempts": attempts,
+    })
+    log_event("report_job_dead_lettered", {
+        "job_id": job["job_id"],
+        "site_id": site_id,
+        "mode": mode,
+        "attempts": attempts,
+        "error": result.get("error"),
+    })
+
+
 async def report_scheduler_loop() -> None:
     while True:
         try:
+            window_open, week_id = report_window_is_open(app.state.config)
+            if not window_open:
+                await asyncio.sleep(max(30, app.state.config["report_scheduler_interval_seconds"]))
+                continue
             async for key in redis_client.scan_iter(match="site_config:*"):
                 raw = await redis_client.get(key)
                 if not raw:
                     continue
                 site_config = json.loads(raw)
-                await deliver_weekly_report(site_config["site_id"], site_config)
+                if not site_config.get("report_email"):
+                    continue
+                await enqueue_report_job(
+                    site_id=site_config["site_id"],
+                    mode="scheduled",
+                    week_id=week_id,
+                    source="scheduler",
+                    report_email=site_config.get("report_email"),
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -609,9 +748,25 @@ async def report_scheduler_loop() -> None:
         await asyncio.sleep(max(30, app.state.config["report_scheduler_interval_seconds"]))
 
 
+async def report_worker_loop() -> None:
+    poll_seconds = max(1, app.state.config["report_worker_poll_seconds"])
+    while True:
+        try:
+            item = await redis_client.brpop(report_jobs_queue_key(), timeout=poll_seconds)
+            if not item:
+                continue
+            _, raw_job = item
+            job = json.loads(raw_job)
+            await process_report_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event("report_worker_error", {"error": str(exc)})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, report_scheduler_task
+    global redis_client, report_scheduler_task, report_worker_task
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
     redis_client = redis.from_url(redis_url, decode_responses=True)
     app.state.redis = redis_client
@@ -619,11 +774,19 @@ async def lifespan(app: FastAPI):
     print(f"Router started - Redis: {redis_url}")
     if app.state.config["report_scheduler_enabled"]:
         report_scheduler_task = asyncio.create_task(report_scheduler_loop())
+    if app.state.config["report_worker_enabled"]:
+        report_worker_task = asyncio.create_task(report_worker_loop())
     yield
     if report_scheduler_task is not None:
         report_scheduler_task.cancel()
         try:
             await report_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    if report_worker_task is not None:
+        report_worker_task.cancel()
+        try:
+            await report_worker_task
         except asyncio.CancelledError:
             pass
     await redis_client.close()
@@ -1379,12 +1542,12 @@ async def send_weekly_test_report(
 ):
     site_config, _ = await require_site_access(request, site_id)
     target_email = email or site_config.get("report_email")
-    result = await send_weekly_report(
+    result = await enqueue_report_job(
         site_id=site_id,
-        site_config=site_config,
+        mode="test",
+        week_id=current_week_id(app.state.config),
+        source="api-send-test",
         report_email=target_email,
-        enforce_schedule_window=False,
-        skip_if_attempted=False,
     )
     return {
         "site_id": site_id,
@@ -1395,13 +1558,18 @@ async def send_weekly_test_report(
 @app.post("/reports/{site_id}/weekly-summary/resend-last")
 async def resend_last_weekly_report(site_id: str, request: Request):
     await require_site_access(request, site_id)
-    result = await resend_last_report_payload(site_id)
-    status_code = 200 if result.get("status") == "sent" else 400
-    return Response(
-        content=json.dumps({"site_id": site_id, "result": result}),
-        media_type="application/json",
-        status_code=status_code,
+    last_payload = await get_last_report_payload(site_id)
+    if not last_payload:
+        raise HTTPException(status_code=400, detail="No previously generated report payload found")
+    result = await enqueue_report_job(
+        site_id=site_id,
+        mode="resend",
+        week_id=last_payload.get("week_id") or current_week_id(app.state.config),
+        source="api-resend-last",
+        report_email=last_payload.get("report_email"),
+        payload=last_payload,
     )
+    return {"site_id": site_id, "result": result}
 
 
 @app.get("/stats/{site_id}/contexts")

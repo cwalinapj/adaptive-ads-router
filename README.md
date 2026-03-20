@@ -79,7 +79,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - Raw route/conversion event export at `GET /events/{site_id}` and `GET /events/{site_id}.csv` protected by the same owner token.
 - Date-filtered event inspection plus a simple daily rollup at `GET /reports/{site_id}/daily`.
 - A downloadable weekly client report at `GET /reports/{site_id}/weekly-summary/html`.
-- Scheduled weekly HTML email delivery to one `report_email` per site, with delivery logs exposed in the dashboard and API.
+- Scheduled weekly HTML email delivery to one `report_email` per site, with Redis-backed queue/worker retries, dead-letter handling, and delivery logs in the dashboard/API.
 
 ## What You Need To Integrate With Real Google Ads
 
@@ -98,8 +98,8 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `GET /reports/{site_id}/weekly-summary` returns a compact weekly JSON summary with top variant, daily trend, recent wins, and recent losses.
 - `GET /reports/{site_id}/weekly-summary/html` renders the same summary as a printable client-facing report.
 - `GET /reports/{site_id}/deliveries` returns recent send attempts (`sent` / `failed`) so you can audit automation health.
-- `POST /reports/{site_id}/weekly-summary/send-test` sends a report immediately (optional `email` query override) and appends delivery logs.
-- `POST /reports/{site_id}/weekly-summary/resend-last` resends the exact last generated email payload (no recompute) for reproducible follow-ups.
+- `POST /reports/{site_id}/weekly-summary/send-test` enqueues a report send immediately (optional `email` query override).
+- `POST /reports/{site_id}/weekly-summary/resend-last` enqueues a resend of the exact last generated email payload (no recompute).
 
 ## Troubleshooting
 
@@ -126,6 +126,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
   - Configure `APP_BASE_URL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, and credentials in `.env`.
   - Confirm scheduler window with `REPORT_SEND_WEEKDAY` (`0=Monday`, `4=Friday`) and `REPORT_SEND_HOUR` in `REPORT_TIMEZONE`.
   - Check `GET /reports/<site_id>/deliveries?token=<owner_token>` for the latest failure reason.
+  - If retries are exhausted, check Redis dead-letter list `report_jobs:dead`.
 - 403 on dashboard or site endpoints:
   - Add the site owner token as `?token=<owner_token>` or send it as `X-AAR-Token: <owner_token>`.
   - For cross-site admin access, set `ADMIN_API_KEY` in `.env` and send that value instead.
@@ -170,6 +171,11 @@ GET  /neural-data/{site_id}
 ```
 
 Optional: Docker MCP service (dev tooling) runs on `:8030`; it is not required for production routing.
+
+Report delivery uses a durable Redis queue:
+- Queue: `report_jobs:queue`
+- Dead-letter: `report_jobs:dead`
+- Idempotency key: `report_job:idem:{site_id}:{week_id}:{mode}`
 
 ## Core Model
 

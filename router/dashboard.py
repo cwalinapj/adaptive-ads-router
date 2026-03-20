@@ -522,12 +522,12 @@ def render_dashboard(site_id: str) -> str:
             throw new Error(payload.detail || "Failed to send test report.");
           }}
           const result = payload.result || {{}};
-          if (result.status === "sent") {{
-            status.textContent = `Sent to ${{result.report_email}} for ${{result.week_id}}.`;
-          }} else if (result.status === "failed") {{
-            status.textContent = `Send failed: ${{result.error || "unknown error"}}`;
+          if (result.status === "queued") {{
+            status.textContent = `Queued test report job (${{result.job?.job_id || "-"}}).`;
+          }} else if (result.status === "duplicate") {{
+            status.textContent = `Skipped duplicate: ${{result.idempotency_key || "idempotency key exists"}}`;
           }} else {{
-            status.textContent = result.reason || "No report sent.";
+            status.textContent = result.error || result.reason || "No report sent.";
           }}
           await loadDashboard();
         }} catch (error) {{
@@ -547,10 +547,16 @@ def render_dashboard(site_id: str) -> str:
           const response = await fetch(url, {{ method: "POST" }});
           const payload = await response.json().catch(() => ({{}}));
           if (!response.ok) {{
-            throw new Error(payload?.result?.error || payload.detail || "Failed to resend last report.");
+            throw new Error(payload?.result?.error || payload.detail || "Failed to queue resend.");
           }}
           const result = payload.result || {{}};
-          status.textContent = `Resent to ${{result.report_email || "-"}} from payload generated at ${{result.generated_at || "-"}}.`;
+          if (result.status === "queued") {{
+            status.textContent = `Queued resend job (${{result.job?.job_id || "-"}}).`;
+          }} else if (result.status === "duplicate") {{
+            status.textContent = `Skipped duplicate resend: ${{result.idempotency_key || "idempotency key exists"}}`;
+          }} else {{
+            status.textContent = result.error || result.reason || "No resend queued.";
+          }}
           await loadDashboard();
         }} catch (error) {{
           status.textContent = error.message;
