@@ -2270,43 +2270,32 @@ def _counter(name: str) -> float:
     return float(app.state.metrics["counters"].get(name, 0.0))
 
 
-@app.get("/ops/metrics")
-async def get_ops_metrics(request: Request):
-    require_admin_access(request)
-    await update_queue_depth_metric()
-    success = _counter("report_send_success_total")
-    failures = _counter("report_send_failure_total")
-    delivered = _counter("provider_status_delivered_total")
-    bounced = _counter("provider_status_bounced_total")
-    complained = _counter("provider_status_complained_total")
-    total_attempts = success + failures
-    delivery_updates = delivered + bounced + complained
-    success_rate = (success / total_attempts) if total_attempts else 0.0
-    bounce_rate = (bounced / delivery_updates) if delivery_updates else 0.0
-    latency_hist = app.state.metrics["histogram"].get("report_send_latency_ms", {"count": 0, "sum": 0.0})
-    avg_latency_ms = (latency_hist["sum"] / latency_hist["count"]) if latency_hist["count"] else 0.0
-    return {
-        "timestamp": now_iso(),
-        "queue_depth": app.state.metrics["gauges"].get("queue_depth", 0.0),
-        "send_latency_ms_avg": round(avg_latency_ms, 2),
-        "send_success_rate": round(success_rate, 4),
-        "bounce_rate": round(bounce_rate, 4),
-        "counters": app.state.metrics["counters"],
-    }
+def _sanitize_metric_name(name: str) -> str:
+    sanitized = []
+    for char in name.lower():
+        if ("a" <= char <= "z") or ("0" <= char <= "9") or char == "_":
+            sanitized.append(char)
+        else:
+            sanitized.append("_")
+    return "".join(sanitized)
 
 
-@app.get("/ops/alerts")
-async def get_ops_alerts(request: Request):
-    require_admin_access(request)
+async def evaluate_ops_alerts() -> dict:
     cfg = app.state.config
     runtime = app.state.runtime
     now_dt = datetime.now()
     alerts = []
+    signals = {
+        "scheduler_stalled": {"active": False, "lag_seconds": 0},
+        "failure_spike": {"active": False, "failure_ratio": 0.0, "events": 0},
+        "zero_send_day": {"active": False, "active_report_sites": 0},
+    }
 
     scheduler_last = runtime.get("scheduler_last_heartbeat")
     if scheduler_last:
         lag = (now_dt - datetime.fromisoformat(scheduler_last)).total_seconds()
         if lag > cfg["alert_scheduler_stall_seconds"]:
+            signals["scheduler_stalled"] = {"active": True, "lag_seconds": int(lag)}
             alerts.append({"type": "scheduler_stalled", "severity": "high", "lag_seconds": int(lag)})
 
     failures = 0
@@ -2336,12 +2325,14 @@ async def get_ops_alerts(request: Request):
                 failures += 1
 
     if active_report_sites > 0 and sends == 0:
+        signals["zero_send_day"] = {"active": True, "active_report_sites": active_report_sites}
         alerts.append({"type": "zero_send_day", "severity": "medium", "active_report_sites": active_report_sites})
 
     total = sends + failures
     if total >= cfg["alert_failure_spike_min_events"]:
         ratio = failures / total if total else 0.0
         if ratio >= cfg["alert_failure_spike_ratio"]:
+            signals["failure_spike"] = {"active": True, "failure_ratio": round(ratio, 4), "events": total}
             alerts.append({
                 "type": "failure_spike",
                 "severity": "high",
@@ -2349,7 +2340,121 @@ async def get_ops_alerts(request: Request):
                 "events": total,
             })
 
-    return {"timestamp": now_iso(), "alerts": alerts, "ok": len(alerts) == 0}
+    return {
+        "timestamp": now_iso(),
+        "alerts": alerts,
+        "ok": len(alerts) == 0,
+        "signals": signals,
+    }
+
+
+@app.get("/ops/metrics")
+async def get_ops_metrics(request: Request):
+    require_admin_access(request)
+    await update_queue_depth_metric()
+    success = _counter("report_send_success_total")
+    failures = _counter("report_send_failure_total")
+    delivered = _counter("provider_status_delivered_total")
+    bounced = _counter("provider_status_bounced_total")
+    complained = _counter("provider_status_complained_total")
+    total_attempts = success + failures
+    delivery_updates = delivered + bounced + complained
+    success_rate = (success / total_attempts) if total_attempts else 0.0
+    bounce_rate = (bounced / delivery_updates) if delivery_updates else 0.0
+    latency_hist = app.state.metrics["histogram"].get("report_send_latency_ms", {"count": 0, "sum": 0.0})
+    avg_latency_ms = (latency_hist["sum"] / latency_hist["count"]) if latency_hist["count"] else 0.0
+    return {
+        "timestamp": now_iso(),
+        "queue_depth": app.state.metrics["gauges"].get("queue_depth", 0.0),
+        "send_latency_ms_avg": round(avg_latency_ms, 2),
+        "send_success_rate": round(success_rate, 4),
+        "bounce_rate": round(bounce_rate, 4),
+        "counters": app.state.metrics["counters"],
+    }
+
+
+@app.get("/ops/metrics/prometheus")
+async def get_ops_metrics_prometheus(request: Request):
+    require_admin_access(request)
+    snapshot = await get_ops_metrics(request)
+    alert_snapshot = await evaluate_ops_alerts()
+    lines = []
+
+    def add_help_and_type(metric_name: str, metric_type: str, help_text: str) -> None:
+        lines.append(f"# HELP {metric_name} {help_text}")
+        lines.append(f"# TYPE {metric_name} {metric_type}")
+
+    counters = snapshot.get("counters", {})
+    for key, value in sorted(counters.items()):
+        metric_name = f"aar_{_sanitize_metric_name(key)}"
+        add_help_and_type(metric_name, "counter", f"Adaptive Ads Router counter for {key}")
+        lines.append(f"{metric_name} {float(value)}")
+
+    add_help_and_type("aar_queue_depth", "gauge", "Current report jobs queue depth")
+    lines.append(f"aar_queue_depth {float(snapshot.get('queue_depth', 0.0))}")
+    add_help_and_type("aar_send_success_rate", "gauge", "Report send success ratio over attempts")
+    lines.append(f"aar_send_success_rate {float(snapshot.get('send_success_rate', 0.0))}")
+    add_help_and_type("aar_bounce_rate", "gauge", "Bounced delivery ratio over provider updates")
+    lines.append(f"aar_bounce_rate {float(snapshot.get('bounce_rate', 0.0))}")
+    add_help_and_type("aar_send_latency_ms_avg", "gauge", "Average report send latency in milliseconds")
+    lines.append(f"aar_send_latency_ms_avg {float(snapshot.get('send_latency_ms_avg', 0.0))}")
+
+    hist = app.state.metrics["histogram"].get("report_send_latency_ms")
+    if hist:
+        add_help_and_type("aar_report_send_latency_ms", "summary", "Report send latency summary")
+        lines.append(f"aar_report_send_latency_ms_count {int(hist['count'])}")
+        lines.append(f"aar_report_send_latency_ms_sum {float(hist['sum'])}")
+
+    signals = alert_snapshot.get("signals", {})
+    add_help_and_type("aar_alert_scheduler_stalled", "gauge", "1 if scheduler heartbeat is stale")
+    lines.append(f"aar_alert_scheduler_stalled {1.0 if signals['scheduler_stalled']['active'] else 0.0}")
+    add_help_and_type("aar_alert_scheduler_lag_seconds", "gauge", "Scheduler heartbeat lag in seconds")
+    lines.append(f"aar_alert_scheduler_lag_seconds {float(signals['scheduler_stalled']['lag_seconds'])}")
+    add_help_and_type("aar_alert_failure_spike", "gauge", "1 if failure spike alert is active")
+    lines.append(f"aar_alert_failure_spike {1.0 if signals['failure_spike']['active'] else 0.0}")
+    add_help_and_type("aar_alert_failure_ratio", "gauge", "Delivery failure ratio over recent events")
+    lines.append(f"aar_alert_failure_ratio {float(signals['failure_spike']['failure_ratio'])}")
+    add_help_and_type("aar_alert_zero_send_day", "gauge", "1 if no sends in last 24h while sites are active")
+    lines.append(f"aar_alert_zero_send_day {1.0 if signals['zero_send_day']['active'] else 0.0}")
+    add_help_and_type("aar_alert_active_report_sites", "gauge", "Active report-enabled sites in zero-send evaluation")
+    lines.append(f"aar_alert_active_report_sites {float(signals['zero_send_day']['active_report_sites'])}")
+
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
+@app.get("/ops/alerts")
+async def get_ops_alerts(request: Request):
+    require_admin_access(request)
+    return await evaluate_ops_alerts()
+
+
+@app.get("/ops/alerts/alertmanager")
+async def get_ops_alerts_alertmanager(request: Request):
+    require_admin_access(request)
+    snapshot = await evaluate_ops_alerts()
+    generated_at = snapshot["timestamp"]
+    base_url = app.state.config["app_base_url"].rstrip("/")
+    alert_docs = []
+    for alert in snapshot["alerts"]:
+        name = f"AAR{''.join(part.capitalize() for part in alert['type'].split('_'))}"
+        annotations = {"summary": f"{alert['type']} detected"}
+        if "lag_seconds" in alert:
+            annotations["description"] = f"Scheduler heartbeat lag is {alert['lag_seconds']} seconds."
+        if "failure_ratio" in alert:
+            annotations["description"] = f"Failure spike ratio is {alert['failure_ratio']} over {alert.get('events', 0)} events."
+        if "active_report_sites" in alert:
+            annotations["description"] = f"No deliveries in last 24h across {alert['active_report_sites']} report-enabled sites."
+        alert_docs.append({
+            "labels": {
+                "alertname": name,
+                "severity": alert.get("severity", "warning"),
+                "service": "adaptive-ads-router",
+            },
+            "annotations": annotations,
+            "startsAt": generated_at,
+            "generatorURL": f"{base_url}/ops/alerts?token=<admin_token>",
+        })
+    return {"receiver": "adaptive-ads-router", "alerts": alert_docs, "status": "firing" if alert_docs else "resolved"}
 
 
 # =============================================================================

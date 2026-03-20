@@ -225,3 +225,21 @@ def test_live_ready_health_endpoints():
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json()["status"] == "healthy"
+
+
+def test_prometheus_and_alertmanager_outputs():
+    _setup()
+    client = TestClient(main.app)
+    main.app.state.runtime["scheduler_last_heartbeat"] = "2000-01-01T00:00:00"
+
+    text = client.get("/ops/metrics/prometheus?token=adminkey")
+    assert text.status_code == 200
+    assert "aar_queue_depth" in text.text
+    assert "aar_send_success_rate" in text.text
+    assert "aar_alert_scheduler_stalled" in text.text
+
+    alerts = client.get("/ops/alerts/alertmanager?token=adminkey")
+    assert alerts.status_code == 200
+    payload = alerts.json()
+    assert "alerts" in payload
+    assert payload["status"] in {"firing", "resolved"}

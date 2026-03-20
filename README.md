@@ -110,6 +110,8 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `GET /live` and `GET /ready` split liveness vs readiness checks for deploy probes.
 - `GET /ops/metrics` (admin token required) returns send latency/success metrics, bounce rate, and queue depth.
 - `GET /ops/alerts` (admin token required) returns scheduler stall/failure spike/zero-send-day alert states.
+- `GET /ops/metrics/prometheus` (admin token required) exposes Prometheus text format metrics.
+- `GET /ops/alerts/alertmanager` (admin token required) emits Alertmanager-style alert payloads.
 
 ## Troubleshooting
 
@@ -184,6 +186,8 @@ POST /reports/{site_id}/dead-letter/replay
 POST /webhooks/report-delivery/{provider}
 GET  /ops/metrics
 GET  /ops/alerts
+GET  /ops/metrics/prometheus
+GET  /ops/alerts/alertmanager
 GET  /r/{site_id}
 GET  /convert/{site_id}/{session_id}
 POST /route/{site_id}
