@@ -321,6 +321,20 @@ def render_dashboard(site_id: str) -> str:
         <article class="card">
           <h2>Delivery Status</h2>
           <p>Latest scheduled weekly-report send attempts for this site.</p>
+          <div class="filter-bar">
+            <label>
+              Override email (optional)
+              <input id="test-report-email" type="email" placeholder="client@example.com" />
+            </label>
+            <label>
+              Send test report
+              <button class="primary-btn" id="send-test-report-btn" type="button">Send test report now</button>
+            </label>
+            <label>
+              Send status
+              <div class="status" id="delivery-status"></div>
+            </label>
+          </div>
           <table>
             <thead>
               <tr>
@@ -489,6 +503,36 @@ def render_dashboard(site_id: str) -> str:
         }}
       }}
 
+      async function sendTestReport() {{
+        const button = document.getElementById("send-test-report-btn");
+        const status = document.getElementById("delivery-status");
+        const overrideEmail = document.getElementById("test-report-email").value.trim();
+        const query = buildQuery(overrideEmail ? {{ email: overrideEmail }} : {{}});
+        const url = withToken(`/reports/${{siteId}}/weekly-summary/send-test${{query ? `?${{query}}` : \"\"}}`);
+        button.disabled = true;
+        status.textContent = "Sending test report...";
+        try {{
+          const response = await fetch(url, {{ method: "POST" }});
+          const payload = await response.json().catch(() => ({{}}));
+          if (!response.ok) {{
+            throw new Error(payload.detail || "Failed to send test report.");
+          }}
+          const result = payload.result || {{}};
+          if (result.status === "sent") {{
+            status.textContent = `Sent to ${{result.report_email}} for ${{result.week_id}}.`;
+          }} else if (result.status === "failed") {{
+            status.textContent = `Send failed: ${{result.error || "unknown error"}}`;
+          }} else {{
+            status.textContent = result.reason || "No report sent.";
+          }}
+          await loadDashboard();
+        }} catch (error) {{
+          status.textContent = error.message;
+        }} finally {{
+          button.disabled = false;
+        }}
+      }}
+
       async function loadDashboard() {{
         const filters = readEventFilters();
         const eventsQuery = buildQuery({{ limit: 12, ...filters }});
@@ -612,6 +656,7 @@ content-type: application/json
       attachCopyHandlers();
       document.getElementById("test-integration-btn").addEventListener("click", runIntegrationTest);
       document.getElementById("apply-event-filters").addEventListener("click", loadDashboard);
+      document.getElementById("send-test-report-btn").addEventListener("click", sendTestReport);
       loadDashboard();
     </script>
   </body>

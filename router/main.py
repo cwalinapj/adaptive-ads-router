@@ -454,19 +454,33 @@ def report_window_is_open(config: dict) -> tuple[bool, str]:
 
 
 async def deliver_weekly_report(site_id: str, site_config: dict) -> None:
-    report_email = site_config.get("report_email")
-    if not report_email:
-        return
+    await send_weekly_report(
+        site_id=site_id,
+        site_config=site_config,
+        report_email=site_config.get("report_email"),
+        enforce_schedule_window=True,
+        skip_if_attempted=True,
+    )
 
+
+async def send_weekly_report(
+    site_id: str,
+    site_config: dict,
+    report_email: Optional[str],
+    enforce_schedule_window: bool,
+    skip_if_attempted: bool,
+) -> dict:
+    if not report_email:
+        return {"status": "skipped", "reason": "report_email is not configured"}
     config = app.state.config
     window_open, week_id = report_window_is_open(config)
-    if not window_open:
-        return
+    if enforce_schedule_window and not window_open:
+        return {"status": "skipped", "reason": "outside delivery window", "week_id": week_id}
 
     last_sent_week = await redis_client.get(report_sent_week_key(site_id))
     last_attempt_week = await redis_client.get(report_attempted_week_key(site_id))
-    if last_sent_week == week_id or last_attempt_week == week_id:
-        return
+    if skip_if_attempted and (last_sent_week == week_id or last_attempt_week == week_id):
+        return {"status": "skipped", "reason": "already attempted this week", "week_id": week_id}
 
     token = site_config.get("owner_token", "")
     report = await build_weekly_summary(site_id, site_config)
@@ -495,6 +509,7 @@ async def deliver_weekly_report(site_id: str, site_config: dict) -> None:
             "report_email": report_email,
             "summary": report["summary"],
         })
+        return {"status": "sent", "week_id": week_id, "report_email": report_email}
     except Exception as exc:
         await redis_client.set(report_attempted_week_key(site_id), week_id)
         await append_delivery_log(site_id, {
@@ -503,6 +518,7 @@ async def deliver_weekly_report(site_id: str, site_config: dict) -> None:
             "report_email": report_email,
             "error": str(exc),
         })
+        return {"status": "failed", "week_id": week_id, "report_email": report_email, "error": str(exc)}
 
 
 async def report_scheduler_loop() -> None:
@@ -1280,6 +1296,27 @@ async def get_report_deliveries(site_id: str, request: Request, limit: int = 20)
         "site_id": site_id,
         "count": len(deliveries),
         "deliveries": deliveries
+    }
+
+
+@app.post("/reports/{site_id}/weekly-summary/send-test")
+async def send_weekly_test_report(
+    site_id: str,
+    request: Request,
+    email: Optional[str] = None,
+):
+    site_config, _ = await require_site_access(request, site_id)
+    target_email = email or site_config.get("report_email")
+    result = await send_weekly_report(
+        site_id=site_id,
+        site_config=site_config,
+        report_email=target_email,
+        enforce_schedule_window=False,
+        skip_if_attempted=False,
+    )
+    return {
+        "site_id": site_id,
+        "result": result,
     }
 
 
