@@ -10,7 +10,7 @@ import json
 import csv
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from typing import Union, Optional, Literal
 
@@ -216,6 +216,79 @@ async def store_site_event(site_id: str, payload: dict) -> None:
 async def get_site_events(site_id: str, limit: int = 100) -> list[dict]:
     rows = await redis_client.lrange(site_events_key(site_id), 0, max(limit - 1, 0))
     return [json.loads(row) for row in rows]
+
+
+def parse_date_value(value: Optional[str], field_name: str) -> Optional[datetime.date]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}. Use YYYY-MM-DD.") from exc
+
+
+def event_in_range(event: dict, start_date, end_date, event_type: Optional[str]) -> bool:
+    if event_type and event.get("event_type") != event_type:
+        return False
+    timestamp = event.get("timestamp")
+    if not timestamp:
+        return False
+    try:
+        event_date = datetime.fromisoformat(timestamp).date()
+    except ValueError:
+        return False
+    if start_date and event_date < start_date:
+        return False
+    if end_date and event_date > end_date:
+        return False
+    return True
+
+
+async def filter_site_events(
+    site_id: str,
+    limit: int = 100,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    event_type: Optional[str] = None
+) -> list[dict]:
+    start_date = parse_date_value(start, "start")
+    end_date = parse_date_value(end, "end")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=400, detail="start must be on or before end")
+    rows = await get_site_events(site_id, limit=app.state.config["event_retention"])
+    filtered = [
+        event for event in rows
+        if event_in_range(event, start_date, end_date, event_type)
+    ]
+    return filtered[:limit]
+
+
+def build_daily_report(events: list[dict]) -> list[dict]:
+    daily = {}
+    for event in events:
+        day = event["timestamp"][:10]
+        bucket = daily.setdefault(day, {
+            "date": day,
+            "routes": 0,
+            "outcomes": 0,
+            "conversions": 0,
+            "revenue": 0.0,
+        })
+        if event.get("event_type") == "route":
+            bucket["routes"] += 1
+        elif event.get("event_type") == "outcome":
+            bucket["outcomes"] += 1
+            if event.get("converted"):
+                bucket["conversions"] += 1
+            bucket["revenue"] += float(event.get("revenue") or 0.0)
+    results = []
+    for day in sorted(daily.keys(), reverse=True):
+        bucket = daily[day]
+        routes = bucket["routes"]
+        conversions = bucket["conversions"]
+        bucket["conversion_rate"] = f"{((conversions / routes) * 100) if routes else 0:.2f}%"
+        results.append(bucket)
+    return results
 
 
 @asynccontextmanager
@@ -814,9 +887,22 @@ async def get_stats(site_id: str, request: Request, device: str = None, geo: str
 
 
 @app.get("/events/{site_id}.csv")
-async def export_events_csv(site_id: str, request: Request, limit: int = 500):
+async def export_events_csv(
+    site_id: str,
+    request: Request,
+    limit: int = 500,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    type: Optional[Literal["route", "outcome"]] = None,
+):
     await require_site_access(request, site_id)
-    events = await get_site_events(site_id, limit=max(1, min(limit, 5000)))
+    events = await filter_site_events(
+        site_id,
+        limit=max(1, min(limit, 5000)),
+        start=start,
+        end=end,
+        event_type=type
+    )
     fieldnames = [
         "timestamp",
         "event_type",
@@ -850,13 +936,65 @@ async def export_events_csv(site_id: str, request: Request, limit: int = 500):
 
 
 @app.get("/events/{site_id}")
-async def get_events(site_id: str, request: Request, limit: int = 50):
+async def get_events(
+    site_id: str,
+    request: Request,
+    limit: int = 50,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    type: Optional[Literal["route", "outcome"]] = None,
+):
     await require_site_access(request, site_id)
-    events = await get_site_events(site_id, limit=max(1, min(limit, 500)))
+    events = await filter_site_events(
+        site_id,
+        limit=max(1, min(limit, 500)),
+        start=start,
+        end=end,
+        event_type=type
+    )
     return {
         "site_id": site_id,
         "count": len(events),
+        "filters": {"start": start, "end": end, "type": type},
         "events": events
+    }
+
+
+@app.get("/reports/{site_id}/daily")
+async def get_daily_report(
+    site_id: str,
+    request: Request,
+    days: int = 7,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    type: Optional[Literal["route", "outcome"]] = None,
+):
+    await require_site_access(request, site_id)
+    if start is None and end is None:
+        days = max(1, min(days, 365))
+        end = datetime.now().date().isoformat()
+        start = (datetime.now().date() - timedelta(days=days - 1)).isoformat()
+    events = await filter_site_events(
+        site_id,
+        limit=app.state.config["event_retention"],
+        start=start,
+        end=end,
+        event_type=type
+    )
+    daily = build_daily_report(events)
+    totals = {
+        "routes": sum(item["routes"] for item in daily),
+        "outcomes": sum(item["outcomes"] for item in daily),
+        "conversions": sum(item["conversions"] for item in daily),
+        "revenue": round(sum(item["revenue"] for item in daily), 2),
+    }
+    totals["conversion_rate"] = f"{((totals['conversions'] / totals['routes']) * 100) if totals['routes'] else 0:.2f}%"
+    return {
+        "site_id": site_id,
+        "filters": {"start": start, "end": end, "type": type},
+        "days": len(daily),
+        "totals": totals,
+        "daily": daily
     }
 
 

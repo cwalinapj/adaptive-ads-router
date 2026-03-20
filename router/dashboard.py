@@ -143,6 +143,26 @@ def render_dashboard(site_id: str) -> str:
       .table-wrap {{
         overflow-x: auto;
       }}
+      .filter-bar {{
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 16px;
+      }}
+      .filter-bar label {{
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }}
+      .filter-bar input, .filter-bar select {{
+        width: 100%;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--ink);
+      }}
       .pill {{
         display: inline-block;
         padding: 6px 10px;
@@ -153,6 +173,7 @@ def render_dashboard(site_id: str) -> str:
       }}
       @media (max-width: 860px) {{
         .grid, .two-col {{ grid-template-columns: 1fr; }}
+        .filter-bar {{ grid-template-columns: 1fr; }}
         .copy-row {{
           flex-direction: column;
           align-items: flex-start;
@@ -271,12 +292,57 @@ def render_dashboard(site_id: str) -> str:
         </article>
 
         <article class="card">
+          <h2>Last 7 Days</h2>
+          <p>Quick operating summary for the most recent week of tracked activity.</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Routes</th>
+                <th>Conversions</th>
+                <th>CVR</th>
+                <th>Revenue</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td id="report-routes">0</td>
+                <td id="report-conversions">0</td>
+                <td id="report-rate">0.00%</td>
+                <td id="report-revenue">0.00</td>
+              </tr>
+            </tbody>
+          </table>
+        </article>
+
+        <article class="card">
           <div class="copy-row">
             <div>
               <h2>Recent Events</h2>
               <p>Inspect raw routed visits and conversion events, then export CSV for reporting.</p>
             </div>
             <button class="copy-btn" data-copy-target="events-url">Copy JSON URL</button>
+          </div>
+          <div class="filter-bar">
+            <label>
+              Start date
+              <input id="events-start" type="date" />
+            </label>
+            <label>
+              End date
+              <input id="events-end" type="date" />
+            </label>
+            <label>
+              Event type
+              <select id="events-type">
+                <option value="">All events</option>
+                <option value="route">Route</option>
+                <option value="outcome">Outcome</option>
+              </select>
+            </label>
+            <label>
+              Apply filters
+              <button class="primary-btn" id="apply-event-filters" type="button">Refresh events</button>
+            </label>
           </div>
           <pre><code id="events-url">Loading events URL...</code></pre>
           <div class="copy-row">
@@ -311,6 +377,24 @@ def render_dashboard(site_id: str) -> str:
         if (!accessToken) return path;
         const separator = path.includes("?") ? "&" : "?";
         return `${{path}}${{separator}}token=${{encodeURIComponent(accessToken)}}`;
+      }}
+
+      function readEventFilters() {{
+        return {{
+          start: document.getElementById("events-start").value,
+          end: document.getElementById("events-end").value,
+          type: document.getElementById("events-type").value,
+        }};
+      }}
+
+      function buildQuery(params) {{
+        const query = new URLSearchParams();
+        Object.entries(params).forEach(([key, value]) => {{
+          if (value !== undefined && value !== null && value !== "") {{
+            query.set(key, value);
+          }}
+        }});
+        return query.toString();
       }}
 
       function attachCopyHandlers() {{
@@ -383,13 +467,17 @@ def render_dashboard(site_id: str) -> str:
       }}
 
       async function loadDashboard() {{
-        const [configRes, statsRes, eventsRes] = await Promise.all([
+        const filters = readEventFilters();
+        const eventsQuery = buildQuery({{ limit: 12, ...filters }});
+        const reportQuery = buildQuery({{ days: 7 }});
+        const [configRes, statsRes, eventsRes, reportRes] = await Promise.all([
           fetch(withToken(`/sites/${{siteId}}`)),
           fetch(withToken(`/stats/${{siteId}}`)),
-          fetch(withToken(`/events/${{siteId}}?limit=12`)),
+          fetch(withToken(`/events/${{siteId}}?${{eventsQuery}}`)),
+          fetch(withToken(`/reports/${{siteId}}/daily?${{reportQuery}}`)),
         ]);
 
-        if (!configRes.ok || !statsRes.ok || !eventsRes.ok) {{
+        if (!configRes.ok || !statsRes.ok || !eventsRes.ok || !reportRes.ok) {{
           document.getElementById("test-status").textContent =
             accessToken ? "Failed to load dashboard data." : "Management token missing or invalid.";
           document.getElementById("variants-table").innerHTML =
@@ -402,6 +490,7 @@ def render_dashboard(site_id: str) -> str:
         const config = await configRes.json();
         const stats = await statsRes.json();
         const eventsPayload = await eventsRes.json();
+        const reportPayload = await reportRes.json();
         const statsByPage = Object.fromEntries((stats.arms || []).map((arm) => [arm.page_id, arm]));
 
         document.getElementById("site-name").textContent = config.site_name || siteId;
@@ -426,14 +515,18 @@ def render_dashboard(site_id: str) -> str:
         const dashboardUrl = config.dashboard_url || withToken(`${{origin}}/dashboard/${{siteId}}`);
         const routeUrl = `${{origin}}/r/${{siteId}}`;
         const conversionUrl = `${{origin}}/convert/${{siteId}}/<aar_session_id>?converted=true`;
-        const eventsUrl = withToken(`${{origin}}/events/${{siteId}}?limit=100`);
-        const eventsCsvUrl = withToken(`${{origin}}/events/${{siteId}}.csv?limit=1000`);
+        const eventsUrl = withToken(`${{origin}}/events/${{siteId}}?${{buildQuery({{ limit: 100, ...filters }})}}`);
+        const eventsCsvUrl = withToken(`${{origin}}/events/${{siteId}}.csv?${{buildQuery({{ limit: 1000, ...filters }})}}`);
 
         document.getElementById("dashboard-url").textContent = dashboardUrl;
         document.getElementById("route-url").textContent = routeUrl;
         document.getElementById("conversion-url").textContent = conversionUrl;
         document.getElementById("events-url").textContent = eventsUrl;
         document.getElementById("events-csv-link").href = eventsCsvUrl;
+        document.getElementById("report-routes").textContent = reportPayload.totals?.routes ?? 0;
+        document.getElementById("report-conversions").textContent = reportPayload.totals?.conversions ?? 0;
+        document.getElementById("report-rate").textContent = reportPayload.totals?.conversion_rate ?? "0.00%";
+        document.getElementById("report-revenue").textContent = (reportPayload.totals?.revenue ?? 0).toFixed(2);
         document.getElementById("frontend-snippet").textContent =
 `<script>
   const params = new URLSearchParams(window.location.search);
@@ -474,6 +567,7 @@ content-type: application/json
 
       attachCopyHandlers();
       document.getElementById("test-integration-btn").addEventListener("click", runIntegrationTest);
+      document.getElementById("apply-event-filters").addEventListener("click", loadDashboard);
       loadDashboard();
     </script>
   </body>
