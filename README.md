@@ -106,13 +106,19 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `POST /webhooks/report-delivery/{provider}` tracks provider lifecycle updates (`accepted`/`delivered`/`bounced`/`complained`) and surfaces them in Delivery Status.
 - Dashboard-triggered POST actions require `X-AAR-CSRF` issued by `GET /dashboard/{site_id}`.
 - Management/report endpoints are rate-limited (`RATE_LIMIT_*` env vars).
+- Every response includes `X-Request-ID` for traceability in structured logs.
+- `GET /live` and `GET /ready` split liveness vs readiness checks for deploy probes.
+- `GET /ops/metrics` (admin token required) returns send latency/success metrics, bounce rate, and queue depth.
+- `GET /ops/alerts` (admin token required) returns scheduler stall/failure spike/zero-send-day alert states.
 
 ## Troubleshooting
 
 - Docker daemon not running:
   - Run `docker info`; if it fails, start Docker Desktop (`open -a Docker`) and retry `./scripts/demo.sh`.
 - Router healthcheck not ready:
-  - Wait 10-30s, then check `curl http://localhost:8024/health`.
+  - Check liveness: `curl http://localhost:8024/live`.
+  - Check readiness: `curl http://localhost:8024/ready`.
+  - Full health summary: `curl http://localhost:8024/health`.
   - If still failing, view logs with `docker compose logs router mcp --tail=200`.
 - Site created but no dashboard data:
   - Open the private dashboard URL returned at setup and confirm the site exists with `curl "http://localhost:8024/sites/<site_id>?token=<owner_token>"`.
@@ -159,6 +165,8 @@ Router service runs on `:8024`:
 
 ```bash
 GET  /
+GET  /live
+GET  /ready
 GET  /sites
 POST /sites/{site_id}
 GET  /sites/{site_id}
@@ -174,6 +182,8 @@ POST /reports/{site_id}/weekly-summary/send-test
 POST /reports/{site_id}/weekly-summary/resend-last
 POST /reports/{site_id}/dead-letter/replay
 POST /webhooks/report-delivery/{provider}
+GET  /ops/metrics
+GET  /ops/alerts
 GET  /r/{site_id}
 GET  /convert/{site_id}/{session_id}
 POST /route/{site_id}

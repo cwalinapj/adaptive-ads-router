@@ -5,12 +5,14 @@ import uuid
 import json
 import secrets
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 import redis.asyncio as redis
 
 
 def get_config():
     return {
+        "config_version": os.getenv("CONFIG_VERSION", "1"),
         "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379"),
         "database_url": os.getenv("DATABASE_URL"),
         "audit_db_enabled": os.getenv("AUDIT_DB_ENABLED", "true").lower() == "true",
@@ -47,6 +49,9 @@ def get_config():
         "rate_limit_window_seconds": int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
         "rate_limit_management_requests": int(os.getenv("RATE_LIMIT_MANAGEMENT_REQUESTS", "120")),
         "rate_limit_report_requests": int(os.getenv("RATE_LIMIT_REPORT_REQUESTS", "240")),
+        "alert_scheduler_stall_seconds": int(os.getenv("ALERT_SCHEDULER_STALL_SECONDS", "900")),
+        "alert_failure_spike_min_events": int(os.getenv("ALERT_FAILURE_SPIKE_MIN_EVENTS", "8")),
+        "alert_failure_spike_ratio": float(os.getenv("ALERT_FAILURE_SPIKE_RATIO", "0.5")),
     }
 
 
@@ -115,3 +120,32 @@ def create_tombstone_record(
 
 def log_event(event_type: str, data: dict):
     print(json.dumps({"timestamp": now_iso(), "event": event_type, **data}))
+
+
+def validate_config(config: dict) -> None:
+    provider = (config.get("report_delivery_provider") or "smtp").lower()
+    if provider not in {"smtp", "sendgrid", "postmark"}:
+        raise RuntimeError("REPORT_DELIVERY_PROVIDER must be one of: smtp, sendgrid, postmark")
+
+    if not (0 <= int(config.get("report_send_weekday", 0)) <= 6):
+        raise RuntimeError("REPORT_SEND_WEEKDAY must be between 0 and 6")
+    if not (0 <= int(config.get("report_send_hour", 0)) <= 23):
+        raise RuntimeError("REPORT_SEND_HOUR must be between 0 and 23")
+    if int(config.get("report_scheduler_interval_seconds", 0)) <= 0:
+        raise RuntimeError("REPORT_SCHEDULER_INTERVAL_SECONDS must be > 0")
+    if int(config.get("report_worker_poll_seconds", 0)) <= 0:
+        raise RuntimeError("REPORT_WORKER_POLL_SECONDS must be > 0")
+    if int(config.get("rate_limit_window_seconds", 0)) <= 0:
+        raise RuntimeError("RATE_LIMIT_WINDOW_SECONDS must be > 0")
+    if int(config.get("rate_limit_management_requests", 0)) <= 0:
+        raise RuntimeError("RATE_LIMIT_MANAGEMENT_REQUESTS must be > 0")
+    if int(config.get("rate_limit_report_requests", 0)) <= 0:
+        raise RuntimeError("RATE_LIMIT_REPORT_REQUESTS must be > 0")
+    if int(config.get("csrf_token_ttl_seconds", 0)) <= 0:
+        raise RuntimeError("CSRF_TOKEN_TTL_SECONDS must be > 0")
+
+    if config.get("audit_db_enabled") and not config.get("database_url"):
+        raise RuntimeError("DATABASE_URL is required when AUDIT_DB_ENABLED=true")
+
+    # Fail fast on invalid timezone names.
+    ZoneInfo(str(config.get("report_timezone", "America/Los_Angeles")))

@@ -13,6 +13,8 @@ import asyncio
 import smtplib
 import uuid
 import hashlib
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from io import StringIO
@@ -41,7 +43,7 @@ from audit_store import AuditStore
 from utils import (
     get_config, generate_session_id, generate_page_id,
     get_container_url, now_iso, create_tombstone_record, log_event,
-    append_query_params, generate_owner_token
+    append_query_params, generate_owner_token, validate_config
 )
 
 
@@ -178,6 +180,12 @@ def is_admin_token(token: Optional[str]) -> bool:
     return bool(admin_api_key and token and secrets.compare_digest(admin_api_key, token))
 
 
+def require_admin_access(request: Request) -> None:
+    token = extract_access_token(request)
+    if not is_admin_token(token):
+        raise HTTPException(status_code=403, detail="Admin token required")
+
+
 async def require_site_access(request: Request, site_id: str) -> tuple[dict, bool]:
     token = extract_access_token(request)
     existing = await get_existing_site_config(site_id)
@@ -261,6 +269,40 @@ async def require_csrf(request: Request, site_id: str) -> None:
     provided = request.headers.get("X-AAR-CSRF", "")
     if not expected or not provided or not secrets.compare_digest(provided, expected):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+
+def metric_inc(name: str, value: float = 1.0) -> None:
+    app.state.metrics["counters"][name] = app.state.metrics["counters"].get(name, 0.0) + value
+
+
+def metric_observe(name: str, value: float) -> None:
+    app.state.metrics["histogram"][name]["count"] += 1
+    app.state.metrics["histogram"][name]["sum"] += float(value)
+
+
+def metric_set(name: str, value: float) -> None:
+    app.state.metrics["gauges"][name] = float(value)
+
+
+def _estimate_queue_depth() -> int:
+    queue_items = getattr(redis_client, "lists", {}).get(report_jobs_queue_key(), [])
+    return len(queue_items)
+
+
+async def update_queue_depth_metric() -> None:
+    depth = None
+    if hasattr(redis_client, "llen"):
+        try:
+            depth = await redis_client.llen(report_jobs_queue_key())
+        except Exception:
+            depth = None
+    if depth is None:
+        try:
+            rows = await redis_client.lrange(report_jobs_queue_key(), 0, 20000)
+            depth = len(rows)
+        except Exception:
+            depth = _estimate_queue_depth()
+    metric_set("queue_depth", float(depth))
 
 
 async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
@@ -701,8 +743,8 @@ def validate_webhook_secret(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
-def report_window_is_open(config: dict) -> tuple[bool, str]:
-    now_local = datetime.now(ZoneInfo(config["report_timezone"]))
+def report_window_is_open(config: dict, now_local: Optional[datetime] = None) -> tuple[bool, str]:
+    now_local = now_local or datetime.now(ZoneInfo(config["report_timezone"]))
     week_id = now_local.strftime("%G-W%V")
     return (
         now_local.weekday() == config["report_send_weekday"] and now_local.hour == config["report_send_hour"],
@@ -710,8 +752,9 @@ def report_window_is_open(config: dict) -> tuple[bool, str]:
     )
 
 
-def current_week_id(config: dict) -> str:
-    return datetime.now(ZoneInfo(config["report_timezone"])).strftime("%G-W%V")
+def current_week_id(config: dict, now_local: Optional[datetime] = None) -> str:
+    now_local = now_local or datetime.now(ZoneInfo(config["report_timezone"]))
+    return now_local.strftime("%G-W%V")
 
 
 def compute_payload_hash(payload: dict) -> str:
@@ -773,7 +816,10 @@ async def send_weekly_report(
     await save_last_report_payload(site_id, payload_snapshot)
 
     try:
+        started = time.perf_counter()
         send_result = await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
+        metric_observe("report_send_latency_ms", (time.perf_counter() - started) * 1000.0)
+        metric_inc("report_send_success_total")
         await redis_client.set(report_sent_week_key(site_id), week_id)
         await bind_provider_message(
             site_id=site_id,
@@ -806,6 +852,7 @@ async def send_weekly_report(
             "provider_status": send_result.get("provider_status"),
         }
     except Exception as exc:
+        metric_inc("report_send_failure_total")
         await append_delivery_log(site_id, {
             "status": "failed",
             "week_id": week_id,
@@ -837,7 +884,10 @@ async def resend_report_payload(site_id: str, payload: dict, actor: str = "worke
         "text_body": text_body,
     })
     try:
+        started = time.perf_counter()
         send_result = await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
+        metric_observe("report_send_latency_ms", (time.perf_counter() - started) * 1000.0)
+        metric_inc("report_send_success_total")
         await bind_provider_message(
             site_id=site_id,
             provider=send_result.get("provider", "unknown"),
@@ -873,6 +923,7 @@ async def resend_report_payload(site_id: str, payload: dict, actor: str = "worke
             "payload_hash": payload_hash,
         }
     except Exception as exc:
+        metric_inc("report_send_failure_total")
         await append_delivery_log(site_id, {
             "status": "failed",
             "mode": "resend",
@@ -932,6 +983,7 @@ async def enqueue_report_job(
             nx=True,
         )
         if not created:
+            metric_inc("report_jobs_duplicate_total")
             return {
                 "status": "duplicate",
                 "reason": "idempotency key already exists",
@@ -940,6 +992,8 @@ async def enqueue_report_job(
                 "mode": mode,
             }
     await redis_client.lpush(report_jobs_queue_key(), json.dumps(job))
+    metric_inc("report_jobs_enqueued_total")
+    await update_queue_depth_metric()
     return {"status": "queued", "job": job}
 
 
@@ -983,6 +1037,7 @@ async def process_report_job(job: dict) -> None:
         result["mode"] = mode
 
     if result.get("status") in {"sent", "skipped"}:
+        metric_inc("report_jobs_processed_total")
         log_event("report_job_processed", {
             "job_id": job["job_id"],
             "site_id": site_id,
@@ -993,6 +1048,7 @@ async def process_report_job(job: dict) -> None:
         return
 
     attempts += 1
+    metric_inc("report_jobs_retry_total")
     job["attempts"] = attempts
     if attempts < max_attempts:
         backoff = app.state.config["report_job_backoff_seconds"] * (2 ** (attempts - 1))
@@ -1013,6 +1069,7 @@ async def process_report_job(job: dict) -> None:
         "last_error": result.get("error"),
     }
     await redis_client.rpush(report_jobs_dead_letter_key(), json.dumps(dead))
+    metric_inc("report_jobs_dead_letter_total")
     await append_delivery_log(site_id, {
         "status": "failed",
         "mode": mode,
@@ -1037,8 +1094,9 @@ class ReplayDeadLetterRequest(BaseModel):
 
 
 async def report_scheduler_loop() -> None:
-    while True:
+    while not app.state.shutting_down:
         try:
+            app.state.runtime["scheduler_last_heartbeat"] = now_iso()
             window_open, week_id = report_window_is_open(app.state.config)
             if not window_open:
                 await asyncio.sleep(max(30, app.state.config["report_scheduler_interval_seconds"]))
@@ -1066,14 +1124,18 @@ async def report_scheduler_loop() -> None:
 
 async def report_worker_loop() -> None:
     poll_seconds = max(1, app.state.config["report_worker_poll_seconds"])
-    while True:
+    while not app.state.shutting_down:
         try:
+            app.state.runtime["worker_last_heartbeat"] = now_iso()
             item = await redis_client.brpop(report_jobs_queue_key(), timeout=poll_seconds)
             if not item:
+                await update_queue_depth_metric()
                 continue
             _, raw_job = item
             job = json.loads(raw_job)
             await process_report_job(job)
+            app.state.runtime["worker_last_processed_at"] = now_iso()
+            await update_queue_depth_metric()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1087,17 +1149,32 @@ async def lifespan(app: FastAPI):
     redis_client = redis.from_url(redis_url, decode_responses=True)
     app.state.redis = redis_client
     app.state.config = get_config()
+    validate_config(app.state.config)
+    app.state.runtime["started_at"] = now_iso()
+    app.state.runtime["scheduler_last_heartbeat"] = now_iso()
+    app.state.runtime["worker_last_heartbeat"] = now_iso()
+    app.state.runtime["worker_last_processed_at"] = None
+    app.state.shutting_down = False
+    provider = (app.state.config.get("report_delivery_provider") or "smtp").lower()
+    if provider == "smtp" and (not app.state.config.get("smtp_host") or not app.state.config.get("smtp_from")):
+        log_event("config_warning", {"message": "SMTP provider selected but SMTP_HOST/SMTP_FROM is not fully configured"})
+    if provider == "sendgrid" and (not app.state.config.get("sendgrid_api_key") or not app.state.config.get("smtp_from")):
+        log_event("config_warning", {"message": "SendGrid provider selected but SENDGRID_API_KEY/SMTP_FROM is missing"})
+    if provider == "postmark" and (not app.state.config.get("postmark_server_token") or not app.state.config.get("smtp_from")):
+        log_event("config_warning", {"message": "Postmark provider selected but POSTMARK_SERVER_TOKEN/SMTP_FROM is missing"})
     if app.state.config["audit_db_enabled"] and app.state.config.get("database_url"):
         audit_store = AuditStore(app.state.config["database_url"])
         await asyncio.to_thread(audit_store.init)
+        await asyncio.to_thread(audit_store.verify_schema)
     else:
         audit_store = None
-    print(f"Router started - Redis: {redis_url}")
+    log_event("service_start", {"redis_url": redis_url, "config_version": app.state.config["config_version"]})
     if app.state.config["report_scheduler_enabled"]:
         report_scheduler_task = asyncio.create_task(report_scheduler_loop())
     if app.state.config["report_worker_enabled"]:
         report_worker_task = asyncio.create_task(report_worker_loop())
     yield
+    app.state.shutting_down = True
     if report_scheduler_task is not None:
         report_scheduler_task.cancel()
         try:
@@ -1128,6 +1205,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.state.metrics = {
+    "counters": {},
+    "gauges": {},
+    "histogram": defaultdict(lambda: {"count": 0, "sum": 0.0}),
+}
+app.state.runtime = {
+    "started_at": now_iso(),
+    "scheduler_last_heartbeat": None,
+    "worker_last_heartbeat": None,
+    "worker_last_processed_at": None,
+}
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    response = None
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        metric_inc("http_requests_total")
+        metric_observe("http_request_duration_ms", duration_ms)
+        metric_inc(f"http_status_{status_code}_total")
+        log_event("http_request", {
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": status_code,
+            "duration_ms": duration_ms,
+            "client_ip": request.client.host if request.client else "unknown",
+        })
+        if response is not None:
+            response.headers["X-Request-ID"] = request_id
 
 
 # =============================================================================
@@ -1286,9 +1403,61 @@ async def apply_outcome_update(request: OutcomeRequest, background_tasks: Option
 # ROUTING ENDPOINTS
 # =============================================================================
 
+@app.get("/live")
+async def live():
+    return {"status": "alive", "service": "adaptive-ads-router"}
+
+
+async def check_readiness() -> tuple[bool, list[str]]:
+    checks = []
+    ready = True
+    try:
+        if hasattr(redis_client, "ping"):
+            await redis_client.ping()
+        else:
+            await redis_client.set("_readiness_probe", "1", ex=5)
+            await redis_client.get("_readiness_probe")
+        checks.append("redis=ok")
+    except Exception as exc:
+        ready = False
+        checks.append(f"redis=error:{exc}")
+
+    cfg = app.state.config
+    if cfg.get("audit_db_enabled"):
+        if audit_store is None:
+            ready = False
+            checks.append("audit_store=missing")
+        else:
+            try:
+                await asyncio.to_thread(audit_store.verify_schema)
+                checks.append("audit_store=ok")
+            except Exception as exc:
+                ready = False
+                checks.append(f"audit_store=error:{exc}")
+    return ready, checks
+
+
+@app.get("/ready")
+async def ready():
+    ok, checks = await check_readiness()
+    if not ok:
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks})
+    return {"status": "ready", "checks": checks}
+
+
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "adaptive-ads-router"}
+    ok, checks = await check_readiness()
+    payload = {
+        "status": "healthy" if ok else "degraded",
+        "service": "adaptive-ads-router",
+        "config_version": app.state.config.get("config_version"),
+        "runtime": app.state.runtime,
+        "checks": checks,
+    }
+    if not ok:
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1997,6 +2166,9 @@ async def report_delivery_webhook(provider: Literal["sendgrid", "postmark"], req
             "provider_status": provider_status,
             "provider_event": event.get("event") or event.get("RecordType"),
         })
+        metric_inc("provider_updates_total")
+        if provider_status:
+            metric_inc(f"provider_status_{provider_status}_total")
         updates += 1
     return {"provider": provider, "processed": len(events), "updated": updates, "ignored": ignored}
 
@@ -2092,6 +2264,92 @@ async def get_neural_data(site_id: str, request: Request, limit: int = 100):
         "count": len(data),
         "sessions": [json.loads(d) for d in data]
     }
+
+
+def _counter(name: str) -> float:
+    return float(app.state.metrics["counters"].get(name, 0.0))
+
+
+@app.get("/ops/metrics")
+async def get_ops_metrics(request: Request):
+    require_admin_access(request)
+    await update_queue_depth_metric()
+    success = _counter("report_send_success_total")
+    failures = _counter("report_send_failure_total")
+    delivered = _counter("provider_status_delivered_total")
+    bounced = _counter("provider_status_bounced_total")
+    complained = _counter("provider_status_complained_total")
+    total_attempts = success + failures
+    delivery_updates = delivered + bounced + complained
+    success_rate = (success / total_attempts) if total_attempts else 0.0
+    bounce_rate = (bounced / delivery_updates) if delivery_updates else 0.0
+    latency_hist = app.state.metrics["histogram"].get("report_send_latency_ms", {"count": 0, "sum": 0.0})
+    avg_latency_ms = (latency_hist["sum"] / latency_hist["count"]) if latency_hist["count"] else 0.0
+    return {
+        "timestamp": now_iso(),
+        "queue_depth": app.state.metrics["gauges"].get("queue_depth", 0.0),
+        "send_latency_ms_avg": round(avg_latency_ms, 2),
+        "send_success_rate": round(success_rate, 4),
+        "bounce_rate": round(bounce_rate, 4),
+        "counters": app.state.metrics["counters"],
+    }
+
+
+@app.get("/ops/alerts")
+async def get_ops_alerts(request: Request):
+    require_admin_access(request)
+    cfg = app.state.config
+    runtime = app.state.runtime
+    now_dt = datetime.now()
+    alerts = []
+
+    scheduler_last = runtime.get("scheduler_last_heartbeat")
+    if scheduler_last:
+        lag = (now_dt - datetime.fromisoformat(scheduler_last)).total_seconds()
+        if lag > cfg["alert_scheduler_stall_seconds"]:
+            alerts.append({"type": "scheduler_stalled", "severity": "high", "lag_seconds": int(lag)})
+
+    failures = 0
+    sends = 0
+    window_start = now_dt - timedelta(days=1)
+    active_report_sites = 0
+    async for key in redis_client.scan_iter(match="site_config:*"):
+        raw = await redis_client.get(key)
+        if not raw:
+            continue
+        site_config = json.loads(raw)
+        if site_config.get("report_email"):
+            active_report_sites += 1
+        for event in await get_delivery_logs(site_config["site_id"], limit=200):
+            ts = event.get("timestamp")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if dt < window_start:
+                continue
+            if event.get("status") == "sent":
+                sends += 1
+            if event.get("status") == "failed":
+                failures += 1
+
+    if active_report_sites > 0 and sends == 0:
+        alerts.append({"type": "zero_send_day", "severity": "medium", "active_report_sites": active_report_sites})
+
+    total = sends + failures
+    if total >= cfg["alert_failure_spike_min_events"]:
+        ratio = failures / total if total else 0.0
+        if ratio >= cfg["alert_failure_spike_ratio"]:
+            alerts.append({
+                "type": "failure_spike",
+                "severity": "high",
+                "failure_ratio": round(ratio, 4),
+                "events": total,
+            })
+
+    return {"timestamp": now_iso(), "alerts": alerts, "ok": len(alerts) == 0}
 
 
 # =============================================================================

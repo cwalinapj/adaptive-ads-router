@@ -165,3 +165,56 @@ def test_webhook_rejects_without_secret():
     client = TestClient(main.app)
     response = client.post("/webhooks/report-delivery/sendgrid", json=[{"event": "delivered"}])
     assert response.status_code == 401
+
+
+def test_webhook_contract_maps_bounce_and_complaint_statuses():
+    _setup_app()
+    client = TestClient(main.app)
+    create = client.post(
+        "/sites/acme-demo",
+        json={
+            "site_name": "Acme Demo",
+            "primary_goal": "lead",
+            "report_email": "client@example.com",
+            "variants": [
+                {"label": "A", "url": "https://a.example"},
+                {"label": "B", "url": "https://b.example"},
+            ],
+        },
+    )
+    token = create.json()["management_token"]
+    main.send_report_email = lambda *_args, **_kwargs: {
+        "provider": "sendgrid",
+        "provider_message_id": "sg-msg-999",
+        "provider_status": "accepted",
+    }
+    queued = asyncio.run(
+        main.enqueue_report_job(
+            site_id="acme-demo",
+            mode="test",
+            week_id="2026-W12",
+            source="test",
+            report_email="client@example.com",
+        )
+    )
+    assert queued["status"] == "queued"
+    popped = asyncio.run(main.redis_client.brpop(main.report_jobs_queue_key()))
+    asyncio.run(main.process_report_job(json.loads(popped[1])))
+
+    bounce = client.post(
+        "/webhooks/report-delivery/sendgrid",
+        headers={"X-AAR-Webhook-Secret": "whsec_test"},
+        json=[{"event": "bounce", "sg_message_id": "sg-msg-999"}],
+    )
+    assert bounce.status_code == 200
+    complaint = client.post(
+        "/webhooks/report-delivery/sendgrid",
+        headers={"X-AAR-Webhook-Secret": "whsec_test"},
+        json=[{"event": "spamreport", "sg_message_id": "sg-msg-999"}],
+    )
+    assert complaint.status_code == 200
+
+    deliveries = client.get(f"/reports/acme-demo/deliveries?token={token}")
+    statuses = [row.get("provider_status") for row in deliveries.json()["deliveries"]]
+    assert "bounced" in statuses
+    assert "complained" in statuses

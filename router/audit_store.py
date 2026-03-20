@@ -19,6 +19,7 @@ from sqlalchemy import (
     select,
     desc,
     and_,
+    inspect,
 )
 
 
@@ -77,6 +78,18 @@ class AuditStore:
 
     def init(self) -> None:
         self.metadata.create_all(self.engine)
+
+    def verify_schema(self) -> None:
+        inspector = inspect(self.engine)
+        required = {
+            "report_payload_snapshots",
+            "report_delivery_events",
+            "report_provider_messages",
+        }
+        existing = set(inspector.get_table_names())
+        missing = required - existing
+        if missing:
+            raise RuntimeError(f"Audit schema missing required tables: {sorted(missing)}")
 
     def save_payload_snapshot(self, payload: dict[str, Any]) -> None:
         generated_at = datetime.fromisoformat(payload["generated_at"])
