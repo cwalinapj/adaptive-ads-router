@@ -12,6 +12,8 @@ import redis.asyncio as redis
 def get_config():
     return {
         "redis_url": os.getenv("REDIS_URL", "redis://localhost:6379"),
+        "database_url": os.getenv("DATABASE_URL"),
+        "audit_db_enabled": os.getenv("AUDIT_DB_ENABLED", "true").lower() == "true",
         "lam_regen_url": os.getenv("LAM_REGEN_URL", "http://lam-regen:8018/regenerate"),
         "first_100_threshold": int(os.getenv("FIRST_100_THRESHOLD", "100")),
         "neural_threshold": int(os.getenv("NEURAL_THRESHOLD", "1000")),

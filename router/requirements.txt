@@ -4,3 +4,5 @@ redis>=5.0.0
 httpx>=0.26.0
 numpy>=1.26.0
 pydantic>=2.5.0
+sqlalchemy>=2.0.0
+psycopg[binary]>=3.2.0

@@ -80,6 +80,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - Date-filtered event inspection plus a simple daily rollup at `GET /reports/{site_id}/daily`.
 - A downloadable weekly client report at `GET /reports/{site_id}/weekly-summary/html`.
 - Scheduled weekly HTML email delivery to one `report_email` per site, with Redis-backed queue/worker retries, dead-letter handling, and delivery logs in the dashboard/API.
+- Durable audit storage in Postgres for immutable payload snapshots + delivery status timeline (`queued`/`sent`/`provider_update`/`failed`).
 
 ## What You Need To Integrate With Real Google Ads
 
@@ -185,6 +186,11 @@ Report delivery uses a durable Redis queue:
 - Dead-letter: `report_jobs:dead`
 - Idempotency key: `report_job:idem:{site_id}:{week_id}:{mode}`
 - Provider statuses are appended through webhook callbacks and shown in dashboard Delivery Status.
+
+Durable audit data is persisted in Postgres:
+- `report_payload_snapshots`: immutable email payload snapshots + payload hash
+- `report_delivery_events`: append-only delivery timeline with actor, provider message id, and status progression
+- `report_provider_messages`: provider message-id binding for webhook reconciliation
 
 ## Core Model
 

@@ -12,6 +12,7 @@ import secrets
 import asyncio
 import smtplib
 import uuid
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from io import StringIO
@@ -36,6 +37,7 @@ from schemas import (
 from bandit import ThompsonSamplingBandit, ContextualBandit, Context
 from diff_enforcer import RegimeDiffEnforcer, DiffEnforcer
 from dashboard import render_dashboard, render_weekly_report
+from audit_store import AuditStore
 from utils import (
     get_config, generate_session_id, generate_page_id,
     get_container_url, now_iso, create_tombstone_record, log_event,
@@ -51,6 +53,7 @@ BanditType = Union[ThompsonSamplingBandit, ContextualBandit]
 redis_client = None
 report_scheduler_task = None
 report_worker_task = None
+audit_store = None
 
 
 def site_config_key(site_id: str) -> str:
@@ -422,9 +425,13 @@ async def append_delivery_log(site_id: str, payload: dict) -> None:
     key = delivery_log_key(site_id)
     await redis_client.lpush(key, json.dumps(event))
     await redis_client.ltrim(key, 0, 99)
+    if audit_store is not None:
+        await asyncio.to_thread(audit_store.append_delivery_event, event)
 
 
 async def get_delivery_logs(site_id: str, limit: int = 20) -> list[dict]:
+    if audit_store is not None:
+        return await asyncio.to_thread(audit_store.list_delivery_events, site_id, limit)
     rows = await redis_client.lrange(delivery_log_key(site_id), 0, max(0, limit - 1))
     return [json.loads(row) for row in rows]
 
@@ -444,9 +451,15 @@ async def get_dead_letter_jobs(site_id: str, limit: int = 20) -> list[dict]:
 
 async def save_last_report_payload(site_id: str, payload: dict) -> None:
     await redis_client.set(last_report_payload_key(site_id), json.dumps(payload))
+    if audit_store is not None:
+        await asyncio.to_thread(audit_store.save_payload_snapshot, payload)
 
 
 async def get_last_report_payload(site_id: str) -> Optional[dict]:
+    if audit_store is not None:
+        snapshot = await asyncio.to_thread(audit_store.get_last_payload_snapshot, site_id)
+        if snapshot:
+            return snapshot
     raw = await redis_client.get(last_report_payload_key(site_id))
     return json.loads(raw) if raw else None
 
@@ -460,9 +473,15 @@ async def bind_provider_message(site_id: str, provider: str, message_id: Optiona
         json.dumps(payload),
         ex=app.state.config["report_idempotency_ttl_seconds"],
     )
+    if audit_store is not None:
+        await asyncio.to_thread(audit_store.bind_provider_message, provider, message_id, payload)
 
 
 async def lookup_provider_message(provider: str, message_id: str) -> Optional[dict]:
+    if audit_store is not None:
+        hit = await asyncio.to_thread(audit_store.lookup_provider_message, provider, message_id)
+        if hit:
+            return hit
     raw = await redis_client.get(provider_message_key(provider, message_id))
     return json.loads(raw) if raw else None
 
@@ -623,11 +642,29 @@ def current_week_id(config: dict) -> str:
     return datetime.now(ZoneInfo(config["report_timezone"])).strftime("%G-W%V")
 
 
+def compute_payload_hash(payload: dict) -> str:
+    canonical = json.dumps(
+        {
+            "site_id": payload["site_id"],
+            "week_id": payload["week_id"],
+            "mode": payload.get("mode", "scheduled"),
+            "report_email": payload["report_email"],
+            "subject": payload["subject"],
+            "html_body": payload["html_body"],
+            "text_body": payload["text_body"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def send_weekly_report(
     site_id: str,
     site_config: dict,
     report_email: Optional[str],
     week_id: Optional[str] = None,
+    actor: str = "worker",
 ) -> dict:
     if not report_email:
         return {"status": "skipped", "reason": "report_email is not configured"}
@@ -653,12 +690,14 @@ async def send_weekly_report(
     payload_snapshot = {
         "site_id": site_id,
         "week_id": week_id,
+        "mode": "scheduled",
         "report_email": report_email,
         "subject": subject,
         "html_body": html_body,
         "text_body": text_body,
         "generated_at": now_iso(),
     }
+    payload_snapshot["payload_hash"] = compute_payload_hash(payload_snapshot)
     await save_last_report_payload(site_id, payload_snapshot)
 
     try:
@@ -668,7 +707,12 @@ async def send_weekly_report(
             site_id=site_id,
             provider=send_result.get("provider", "unknown"),
             message_id=send_result.get("provider_message_id"),
-            metadata={"week_id": week_id, "report_email": report_email},
+            metadata={
+                "week_id": week_id,
+                "report_email": report_email,
+                "mode": "scheduled",
+                "payload_hash": payload_snapshot["payload_hash"],
+            },
         )
         await append_delivery_log(site_id, {
             "status": "sent",
@@ -678,6 +722,8 @@ async def send_weekly_report(
             "provider": send_result.get("provider"),
             "provider_message_id": send_result.get("provider_message_id"),
             "provider_status": send_result.get("provider_status"),
+            "payload_hash": payload_snapshot["payload_hash"],
+            "actor": actor,
         })
         return {
             "status": "sent",
@@ -693,11 +739,13 @@ async def send_weekly_report(
             "week_id": week_id,
             "report_email": report_email,
             "error": str(exc),
+            "payload_hash": payload_snapshot["payload_hash"],
+            "actor": actor,
         })
         return {"status": "failed", "week_id": week_id, "report_email": report_email, "error": str(exc)}
 
 
-async def resend_report_payload(site_id: str, payload: dict) -> dict:
+async def resend_report_payload(site_id: str, payload: dict, actor: str = "worker") -> dict:
     config = app.state.config
     report_email = payload.get("report_email")
     subject = payload.get("subject")
@@ -707,13 +755,27 @@ async def resend_report_payload(site_id: str, payload: dict) -> dict:
     if not report_email or not subject or not html_body or not text_body:
         return {"status": "failed", "error": "Stored report payload is incomplete"}
 
+    payload_hash = payload.get("payload_hash") or compute_payload_hash({
+        "site_id": site_id,
+        "week_id": week_id,
+        "mode": payload.get("mode", "resend"),
+        "report_email": report_email,
+        "subject": subject,
+        "html_body": html_body,
+        "text_body": text_body,
+    })
     try:
         send_result = await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
         await bind_provider_message(
             site_id=site_id,
             provider=send_result.get("provider", "unknown"),
             message_id=send_result.get("provider_message_id"),
-            metadata={"week_id": week_id, "report_email": report_email, "mode": "resend"},
+            metadata={
+                "week_id": week_id,
+                "report_email": report_email,
+                "mode": "resend",
+                "payload_hash": payload_hash,
+            },
         )
         await append_delivery_log(site_id, {
             "status": "sent",
@@ -724,6 +786,8 @@ async def resend_report_payload(site_id: str, payload: dict) -> dict:
             "provider": send_result.get("provider"),
             "provider_message_id": send_result.get("provider_message_id"),
             "provider_status": send_result.get("provider_status"),
+            "payload_hash": payload_hash,
+            "actor": actor,
         })
         return {
             "status": "sent",
@@ -734,6 +798,7 @@ async def resend_report_payload(site_id: str, payload: dict) -> dict:
             "provider": send_result.get("provider"),
             "provider_message_id": send_result.get("provider_message_id"),
             "provider_status": send_result.get("provider_status"),
+            "payload_hash": payload_hash,
         }
     except Exception as exc:
         await append_delivery_log(site_id, {
@@ -742,6 +807,8 @@ async def resend_report_payload(site_id: str, payload: dict) -> dict:
             "week_id": week_id,
             "report_email": report_email,
             "generated_at": payload.get("generated_at"),
+            "payload_hash": payload_hash,
+            "actor": actor,
             "error": str(exc),
         })
         return {
@@ -758,7 +825,7 @@ async def resend_last_report_payload(site_id: str) -> dict:
     payload = await get_last_report_payload(site_id)
     if not payload:
         return {"status": "failed", "error": "No previously generated report payload found"}
-    return await resend_report_payload(site_id, payload)
+    return await resend_report_payload(site_id, payload, actor="api-resend-last")
 
 
 async def enqueue_report_job(
@@ -832,13 +899,14 @@ async def process_report_job(job: dict) -> None:
         if not payload:
             result = {"status": "failed", "error": "No previously generated report payload found"}
         else:
-            result = await resend_report_payload(site_id, payload)
+            result = await resend_report_payload(site_id, payload, actor=job.get("source", "worker"))
     else:
         result = await send_weekly_report(
             site_id=site_id,
             site_config=site_config,
             report_email=job.get("report_email") or site_config.get("report_email"),
             week_id=week_id,
+            actor=job.get("source", "worker"),
         )
         result["mode"] = mode
 
@@ -942,11 +1010,16 @@ async def report_worker_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client, report_scheduler_task, report_worker_task
+    global redis_client, report_scheduler_task, report_worker_task, audit_store
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
     redis_client = redis.from_url(redis_url, decode_responses=True)
     app.state.redis = redis_client
     app.state.config = get_config()
+    if app.state.config["audit_db_enabled"] and app.state.config.get("database_url"):
+        audit_store = AuditStore(app.state.config["database_url"])
+        await asyncio.to_thread(audit_store.init)
+    else:
+        audit_store = None
     print(f"Router started - Redis: {redis_url}")
     if app.state.config["report_scheduler_enabled"]:
         report_scheduler_task = asyncio.create_task(report_scheduler_loop())
@@ -965,6 +1038,8 @@ async def lifespan(app: FastAPI):
             await report_worker_task
         except asyncio.CancelledError:
             pass
+    if audit_store is not None:
+        await asyncio.to_thread(audit_store.engine.dispose)
     await redis_client.close()
 
 
