@@ -18,7 +18,20 @@ def get_config():
         "confidence_threshold": float(os.getenv("CONFIDENCE_THRESHOLD", "0.95")),
         "min_samples_per_arm": int(os.getenv("MIN_SAMPLES_PER_ARM", "3")),
         "admin_api_key": os.getenv("ADMIN_API_KEY"),
+        "app_base_url": os.getenv("APP_BASE_URL", "http://localhost:8024"),
         "event_retention": int(os.getenv("EVENT_RETENTION", "5000")),
+        "report_scheduler_enabled": os.getenv("REPORT_SCHEDULER_ENABLED", "true").lower() == "true",
+        "report_scheduler_interval_seconds": int(os.getenv("REPORT_SCHEDULER_INTERVAL_SECONDS", "300")),
+        "report_send_weekday": int(os.getenv("REPORT_SEND_WEEKDAY", "4")),
+        "report_send_hour": int(os.getenv("REPORT_SEND_HOUR", "9")),
+        "report_timezone": os.getenv("REPORT_TIMEZONE", "America/Los_Angeles"),
+        "smtp_host": os.getenv("SMTP_HOST"),
+        "smtp_port": int(os.getenv("SMTP_PORT", "587")),
+        "smtp_username": os.getenv("SMTP_USERNAME"),
+        "smtp_password": os.getenv("SMTP_PASSWORD"),
+        "smtp_from": os.getenv("SMTP_FROM"),
+        "smtp_use_tls": os.getenv("SMTP_USE_TLS", "true").lower() == "true",
+        "smtp_use_ssl": os.getenv("SMTP_USE_SSL", "false").lower() == "true",
     }
 
 

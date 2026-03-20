@@ -319,6 +319,25 @@ def render_dashboard(site_id: str) -> str:
         </article>
 
         <article class="card">
+          <h2>Delivery Status</h2>
+          <p>Latest scheduled weekly-report send attempts for this site.</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Status</th>
+                <th>Email</th>
+                <th>Week</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody id="delivery-table">
+              <tr><td colspan="5">Loading delivery logs...</td></tr>
+            </tbody>
+          </table>
+        </article>
+
+        <article class="card">
           <div class="copy-row">
             <div>
               <h2>Recent Events</h2>
@@ -474,20 +493,23 @@ def render_dashboard(site_id: str) -> str:
         const filters = readEventFilters();
         const eventsQuery = buildQuery({{ limit: 12, ...filters }});
         const reportQuery = buildQuery({{ days: 7 }});
-        const [configRes, statsRes, eventsRes, reportRes] = await Promise.all([
+        const [configRes, statsRes, eventsRes, reportRes, deliveriesRes] = await Promise.all([
           fetch(withToken(`/sites/${{siteId}}`)),
           fetch(withToken(`/stats/${{siteId}}`)),
           fetch(withToken(`/events/${{siteId}}?${{eventsQuery}}`)),
           fetch(withToken(`/reports/${{siteId}}/daily?${{reportQuery}}`)),
+          fetch(withToken(`/reports/${{siteId}}/deliveries?limit=10`)),
         ]);
 
-        if (!configRes.ok || !statsRes.ok || !eventsRes.ok || !reportRes.ok) {{
+        if (!configRes.ok || !statsRes.ok || !eventsRes.ok || !reportRes.ok || !deliveriesRes.ok) {{
           document.getElementById("test-status").textContent =
             accessToken ? "Failed to load dashboard data." : "Management token missing or invalid.";
           document.getElementById("variants-table").innerHTML =
             '<tr><td colspan="5">Failed to load dashboard data.</td></tr>';
           document.getElementById("events-table").innerHTML =
             '<tr><td colspan="5">Failed to load recent events.</td></tr>';
+          document.getElementById("delivery-table").innerHTML =
+            '<tr><td colspan="5">Failed to load delivery logs.</td></tr>';
           return;
         }}
 
@@ -495,6 +517,7 @@ def render_dashboard(site_id: str) -> str:
         const stats = await statsRes.json();
         const eventsPayload = await eventsRes.json();
         const reportPayload = await reportRes.json();
+        const deliveriesPayload = await deliveriesRes.json();
         const statsByPage = Object.fromEntries((stats.arms || []).map((arm) => [arm.page_id, arm]));
 
         document.getElementById("site-name").textContent = config.site_name || siteId;
@@ -569,6 +592,21 @@ content-type: application/json
         }});
         document.getElementById("events-table").innerHTML =
           eventRows.join("") || '<tr><td colspan="5">No events recorded yet.</td></tr>';
+
+        const deliveryRows = (deliveriesPayload.deliveries || []).map((entry) => {{
+          const detail = entry.status === "failed" ? (entry.error || "Send failed") : "Delivered";
+          return `
+            <tr>
+              <td><code>${{entry.timestamp || "-"}}</code></td>
+              <td>${{entry.status || "-"}}</td>
+              <td><code>${{entry.report_email || "-"}}</code></td>
+              <td><code>${{entry.week_id || "-"}}</code></td>
+              <td>${{detail}}</td>
+            </tr>
+          `;
+        }});
+        document.getElementById("delivery-table").innerHTML =
+          deliveryRows.join("") || '<tr><td colspan="5">No delivery logs yet.</td></tr>';
       }}
 
       attachCopyHandlers();

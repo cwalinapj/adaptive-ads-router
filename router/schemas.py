@@ -108,6 +108,7 @@ class SiteVariant(BaseModel):
 class SiteConfigRequest(BaseModel):
     site_name: Optional[str] = None
     primary_goal: Optional[str] = "lead"
+    report_email: Optional[str] = None
     variants: List[SiteVariant] = Field(min_length=2)
 
 
@@ -115,6 +116,7 @@ class SiteConfigResponse(BaseModel):
     site_id: str
     site_name: str
     primary_goal: str
+    report_email: Optional[str] = None
     variants: List[SiteVariant]
     created_at: Optional[str] = None
     updated_at: str

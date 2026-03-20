@@ -9,10 +9,15 @@ import os
 import json
 import csv
 import secrets
+import asyncio
+import smtplib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from io import StringIO
 from typing import Union, Optional, Literal
+from zoneinfo import ZoneInfo
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,6 +47,7 @@ BanditType = Union[ThompsonSamplingBandit, ContextualBandit]
 
 # Redis client (global)
 redis_client = None
+report_scheduler_task = None
 
 
 def site_config_key(site_id: str) -> str:
@@ -52,6 +58,18 @@ def site_events_key(site_id: str) -> str:
     return f"events:{site_id}"
 
 
+def delivery_log_key(site_id: str) -> str:
+    return f"report_delivery:{site_id}"
+
+
+def report_sent_week_key(site_id: str) -> str:
+    return f"report_week_sent:{site_id}"
+
+
+def report_attempted_week_key(site_id: str) -> str:
+    return f"report_week_attempted:{site_id}"
+
+
 def build_default_site_config(site_id: str) -> dict:
     page_a = generate_page_id(site_id, "a")
     page_b = generate_page_id(site_id, "b")
@@ -59,6 +77,7 @@ def build_default_site_config(site_id: str) -> dict:
         "site_id": site_id,
         "site_name": site_id.replace("-", " ").title(),
         "primary_goal": "lead",
+        "report_email": None,
         "owner_token": generate_owner_token(),
         "variants": [
             {
@@ -154,6 +173,7 @@ async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
     existing = await get_existing_site_config(site_id)
     created_at = existing.get("created_at") if existing else now_iso()
     owner_token = existing.get("owner_token") if existing else generate_owner_token()
+    report_email = request.report_email if request.report_email is not None else (existing.get("report_email") if existing else None)
 
     variants = []
     for idx, variant in enumerate(request.variants):
@@ -169,6 +189,7 @@ async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
         "site_id": site_id,
         "site_name": request.site_name or site_id.replace("-", " ").title(),
         "primary_goal": request.primary_goal or "lead",
+        "report_email": report_email,
         "owner_token": owner_token,
         "variants": variants,
         "created_at": created_at,
@@ -377,15 +398,146 @@ async def build_weekly_summary(
     }
 
 
+async def append_delivery_log(site_id: str, payload: dict) -> None:
+    event = {"timestamp": now_iso(), "site_id": site_id, **payload}
+    key = delivery_log_key(site_id)
+    await redis_client.lpush(key, json.dumps(event))
+    await redis_client.ltrim(key, 0, 99)
+
+
+async def get_delivery_logs(site_id: str, limit: int = 20) -> list[dict]:
+    rows = await redis_client.lrange(delivery_log_key(site_id), 0, max(0, limit - 1))
+    return [json.loads(row) for row in rows]
+
+
+def send_report_email(config: dict, to_email: str, subject: str, html_body: str, text_body: str) -> None:
+    smtp_from = config.get("smtp_from")
+    smtp_host = config.get("smtp_host")
+    if not smtp_host or not smtp_from:
+        raise RuntimeError("SMTP_HOST and SMTP_FROM must be configured")
+
+    message = MIMEMultipart("alternative")
+    message["Subject"] = subject
+    message["From"] = smtp_from
+    message["To"] = to_email
+    message.attach(MIMEText(text_body, "plain"))
+    message.attach(MIMEText(html_body, "html"))
+
+    smtp_port = config.get("smtp_port", 587)
+    smtp_username = config.get("smtp_username")
+    smtp_password = config.get("smtp_password")
+    use_ssl = config.get("smtp_use_ssl", False)
+    use_tls = config.get("smtp_use_tls", True)
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+            if smtp_username:
+                server.login(smtp_username, smtp_password or "")
+            server.sendmail(smtp_from, [to_email], message.as_string())
+        return
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        if use_tls:
+            server.starttls()
+        if smtp_username:
+            server.login(smtp_username, smtp_password or "")
+        server.sendmail(smtp_from, [to_email], message.as_string())
+
+
+def report_window_is_open(config: dict) -> tuple[bool, str]:
+    now_local = datetime.now(ZoneInfo(config["report_timezone"]))
+    week_id = now_local.strftime("%G-W%V")
+    return (
+        now_local.weekday() == config["report_send_weekday"] and now_local.hour == config["report_send_hour"],
+        week_id,
+    )
+
+
+async def deliver_weekly_report(site_id: str, site_config: dict) -> None:
+    report_email = site_config.get("report_email")
+    if not report_email:
+        return
+
+    config = app.state.config
+    window_open, week_id = report_window_is_open(config)
+    if not window_open:
+        return
+
+    last_sent_week = await redis_client.get(report_sent_week_key(site_id))
+    last_attempt_week = await redis_client.get(report_attempted_week_key(site_id))
+    if last_sent_week == week_id or last_attempt_week == week_id:
+        return
+
+    token = site_config.get("owner_token", "")
+    report = await build_weekly_summary(site_id, site_config)
+    base_url = config["app_base_url"].rstrip("/")
+    report_url = f"{base_url}/reports/{site_id}/weekly-summary?token={token}"
+    dashboard_url = f"{base_url}/dashboard/{site_id}?token={token}"
+    html_body = render_weekly_report(site_config, report, report_url, dashboard_url)
+    text_body = (
+        f"Weekly report for {site_config['site_name']}\n"
+        f"Routes: {report['summary']['routes']}\n"
+        f"Conversions: {report['summary']['conversions']}\n"
+        f"CVR: {report['summary']['conversion_rate']}\n"
+        f"Revenue: {report['summary']['revenue']:.2f}\n"
+        f"Dashboard: {dashboard_url}\n"
+        f"JSON Report: {report_url}\n"
+    )
+    subject = f"[Adaptive Ads Router] Weekly report - {site_config['site_name']}"
+
+    try:
+        await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
+        await redis_client.set(report_sent_week_key(site_id), week_id)
+        await redis_client.set(report_attempted_week_key(site_id), week_id)
+        await append_delivery_log(site_id, {
+            "status": "sent",
+            "week_id": week_id,
+            "report_email": report_email,
+            "summary": report["summary"],
+        })
+    except Exception as exc:
+        await redis_client.set(report_attempted_week_key(site_id), week_id)
+        await append_delivery_log(site_id, {
+            "status": "failed",
+            "week_id": week_id,
+            "report_email": report_email,
+            "error": str(exc),
+        })
+
+
+async def report_scheduler_loop() -> None:
+    while True:
+        try:
+            async for key in redis_client.scan_iter(match="site_config:*"):
+                raw = await redis_client.get(key)
+                if not raw:
+                    continue
+                site_config = json.loads(raw)
+                await deliver_weekly_report(site_config["site_id"], site_config)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event("report_scheduler_error", {"error": str(exc)})
+        await asyncio.sleep(max(30, app.state.config["report_scheduler_interval_seconds"]))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client
+    global redis_client, report_scheduler_task
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
     redis_client = redis.from_url(redis_url, decode_responses=True)
     app.state.redis = redis_client
     app.state.config = get_config()
     print(f"Router started - Redis: {redis_url}")
+    if app.state.config["report_scheduler_enabled"]:
+        report_scheduler_task = asyncio.create_task(report_scheduler_loop())
     yield
+    if report_scheduler_task is not None:
+        report_scheduler_task.cancel()
+        try:
+            await report_scheduler_task
+        except asyncio.CancelledError:
+            pass
     await redis_client.close()
 
 
@@ -623,6 +775,10 @@ async def home():
             Primary goal
             <input id="primary-goal" name="primary_goal" value="lead" />
           </label>
+          <label>
+            Client report email (optional)
+            <input id="report-email" name="report_email" type="email" placeholder="client@example.com" />
+          </label>
           <div class="two-col">
             <label>
               Variant A label
@@ -656,6 +812,7 @@ async def home():
   -d '{{
     "site_name": "Acme Demo",
     "primary_goal": "lead",
+    "report_email": "client@example.com",
     "variants": [
       {{"label": "Control", "url": "https://example.com/landing-a"}},
       {{"label": "Challenger", "url": "https://example.com/landing-b"}}
@@ -674,6 +831,7 @@ async def home():
         const payload = {{
           site_name: document.getElementById("site-name").value.trim(),
           primary_goal: document.getElementById("primary-goal").value.trim() || "lead",
+          report_email: document.getElementById("report-email").value.trim() || null,
           variants: [
             {{
               label: document.getElementById("variant-a-label").value.trim(),
@@ -1112,6 +1270,17 @@ async def get_weekly_summary_html(
         dashboard_url = f"{dashboard_url}?token={token}"
         report_url = f"{report_url}?token={token}"
     return HTMLResponse(render_weekly_report(site_config, report, report_url, dashboard_url))
+
+
+@app.get("/reports/{site_id}/deliveries")
+async def get_report_deliveries(site_id: str, request: Request, limit: int = 20):
+    await require_site_access(request, site_id)
+    deliveries = await get_delivery_logs(site_id, limit=max(1, min(limit, 100)))
+    return {
+        "site_id": site_id,
+        "count": len(deliveries),
+        "deliveries": deliveries
+    }
 
 
 @app.get("/stats/{site_id}/contexts")

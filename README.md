@@ -42,6 +42,7 @@ open http://localhost:8024/
 6. Inspect raw events at `GET /events/{site_id}?token=...` or export CSV from `GET /events/{site_id}.csv?token=...`.
 7. Pull a last-7-days rollup from `GET /reports/{site_id}/daily?token=...`.
 8. Open the weekly client report at `GET /reports/{site_id}/weekly-summary/html?token=...`.
+9. Configure `report_email` for the site to enable scheduled weekly delivery and monitor send logs in the dashboard.
 
 ## One-Command Demo (Sample Data)
 
@@ -78,12 +79,14 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - Raw route/conversion event export at `GET /events/{site_id}` and `GET /events/{site_id}.csv` protected by the same owner token.
 - Date-filtered event inspection plus a simple daily rollup at `GET /reports/{site_id}/daily`.
 - A downloadable weekly client report at `GET /reports/{site_id}/weekly-summary/html`.
+- Scheduled weekly HTML email delivery to one `report_email` per site, with delivery logs exposed in the dashboard and API.
 
 ## What You Need To Integrate With Real Google Ads
 
 - Point ad traffic to `GET /r/{site_id}` (or a reverse proxy in front of it) so the router can choose the destination URL per click.
 - Define conversion tracking and call `GET /convert/{site_id}/{session_id}` or `POST /outcome` from your thank-you page, backend event, or pixel/webhook bridge.
 - Configure where variants live by creating a site with labeled destination URLs in the home form or `POST /sites/{site_id}`.
+- Set `report_email` on the site config if you want automatic weekly client-report delivery.
 - Keep the private dashboard URL or owner token returned at site creation. You need it for dashboard, stats, and site management requests.
 - Today’s integration method: keep your existing pages, route the click through Adaptive Ads Router, then let it redirect the visitor to the chosen variant.
 - `GET /r/{site_id}` redirects to the configured variant URL and appends `aar_site_id`, `aar_page_id`, and `aar_session_id`.
@@ -94,6 +97,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `GET /reports/{site_id}/daily` returns daily route/conversion/revenue totals and defaults to the last 7 days when no explicit range is provided.
 - `GET /reports/{site_id}/weekly-summary` returns a compact weekly JSON summary with top variant, daily trend, recent wins, and recent losses.
 - `GET /reports/{site_id}/weekly-summary/html` renders the same summary as a printable client-facing report.
+- `GET /reports/{site_id}/deliveries` returns recent send attempts (`sent` / `failed`) so you can audit automation health.
 
 ## Troubleshooting
 
@@ -111,6 +115,11 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
   - Open `GET /reports/<site_id>/daily?token=<owner_token>` or use the dashboard’s `Last 7 Days` card.
 - Need something client-ready:
   - Open `GET /reports/<site_id>/weekly-summary/html?token=<owner_token>` from the dashboard and share or print that page.
+- Scheduled emails not arriving:
+  - Ensure the site has `report_email` set.
+  - Configure `APP_BASE_URL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, and credentials in `.env`.
+  - Confirm scheduler window with `REPORT_SEND_WEEKDAY` (`0=Monday`, `4=Friday`) and `REPORT_SEND_HOUR` in `REPORT_TIMEZONE`.
+  - Check `GET /reports/<site_id>/deliveries?token=<owner_token>` for the latest failure reason.
 - 403 on dashboard or site endpoints:
   - Add the site owner token as `?token=<owner_token>` or send it as `X-AAR-Token: <owner_token>`.
   - For cross-site admin access, set `ADMIN_API_KEY` in `.env` and send that value instead.
@@ -140,6 +149,7 @@ GET  /events/{site_id}.csv
 GET  /reports/{site_id}/daily
 GET  /reports/{site_id}/weekly-summary
 GET  /reports/{site_id}/weekly-summary/html
+GET  /reports/{site_id}/deliveries
 GET  /r/{site_id}
 GET  /convert/{site_id}/{session_id}
 POST /route/{site_id}
