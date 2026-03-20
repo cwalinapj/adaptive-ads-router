@@ -331,6 +331,10 @@ def render_dashboard(site_id: str) -> str:
               <button class="primary-btn" id="send-test-report-btn" type="button">Send test report now</button>
             </label>
             <label>
+              Resend last payload
+              <button class="primary-btn" id="resend-last-report-btn" type="button">Resend last report</button>
+            </label>
+            <label>
               Send status
               <div class="status" id="delivery-status"></div>
             </label>
@@ -533,6 +537,28 @@ def render_dashboard(site_id: str) -> str:
         }}
       }}
 
+      async function resendLastReport() {{
+        const button = document.getElementById("resend-last-report-btn");
+        const status = document.getElementById("delivery-status");
+        const url = withToken(`/reports/${{siteId}}/weekly-summary/resend-last`);
+        button.disabled = true;
+        status.textContent = "Resending last payload...";
+        try {{
+          const response = await fetch(url, {{ method: "POST" }});
+          const payload = await response.json().catch(() => ({{}}));
+          if (!response.ok) {{
+            throw new Error(payload?.result?.error || payload.detail || "Failed to resend last report.");
+          }}
+          const result = payload.result || {{}};
+          status.textContent = `Resent to ${{result.report_email || "-"}} from payload generated at ${{result.generated_at || "-"}}.`;
+          await loadDashboard();
+        }} catch (error) {{
+          status.textContent = error.message;
+        }} finally {{
+          button.disabled = false;
+        }}
+      }}
+
       async function loadDashboard() {{
         const filters = readEventFilters();
         const eventsQuery = buildQuery({{ limit: 12, ...filters }});
@@ -638,7 +664,10 @@ content-type: application/json
           eventRows.join("") || '<tr><td colspan="5">No events recorded yet.</td></tr>';
 
         const deliveryRows = (deliveriesPayload.deliveries || []).map((entry) => {{
-          const detail = entry.status === "failed" ? (entry.error || "Send failed") : "Delivered";
+          const modeLabel = entry.mode ? `mode=${{entry.mode}}` : "mode=scheduled";
+          const detail = entry.status === "failed"
+            ? `${{modeLabel}} | ${{entry.error || "Send failed"}}`
+            : `${{modeLabel}} | Delivered`;
           return `
             <tr>
               <td><code>${{entry.timestamp || "-"}}</code></td>
@@ -657,6 +686,7 @@ content-type: application/json
       document.getElementById("test-integration-btn").addEventListener("click", runIntegrationTest);
       document.getElementById("apply-event-filters").addEventListener("click", loadDashboard);
       document.getElementById("send-test-report-btn").addEventListener("click", sendTestReport);
+      document.getElementById("resend-last-report-btn").addEventListener("click", resendLastReport);
       loadDashboard();
     </script>
   </body>

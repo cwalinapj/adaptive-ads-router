@@ -70,6 +70,10 @@ def report_attempted_week_key(site_id: str) -> str:
     return f"report_week_attempted:{site_id}"
 
 
+def last_report_payload_key(site_id: str) -> str:
+    return f"report_payload_last:{site_id}"
+
+
 def build_default_site_config(site_id: str) -> dict:
     page_a = generate_page_id(site_id, "a")
     page_b = generate_page_id(site_id, "b")
@@ -410,6 +414,15 @@ async def get_delivery_logs(site_id: str, limit: int = 20) -> list[dict]:
     return [json.loads(row) for row in rows]
 
 
+async def save_last_report_payload(site_id: str, payload: dict) -> None:
+    await redis_client.set(last_report_payload_key(site_id), json.dumps(payload))
+
+
+async def get_last_report_payload(site_id: str) -> Optional[dict]:
+    raw = await redis_client.get(last_report_payload_key(site_id))
+    return json.loads(raw) if raw else None
+
+
 def send_report_email(config: dict, to_email: str, subject: str, html_body: str, text_body: str) -> None:
     smtp_from = config.get("smtp_from")
     smtp_host = config.get("smtp_host")
@@ -498,6 +511,16 @@ async def send_weekly_report(
         f"JSON Report: {report_url}\n"
     )
     subject = f"[Adaptive Ads Router] Weekly report - {site_config['site_name']}"
+    payload_snapshot = {
+        "site_id": site_id,
+        "week_id": week_id,
+        "report_email": report_email,
+        "subject": subject,
+        "html_body": html_body,
+        "text_body": text_body,
+        "generated_at": now_iso(),
+    }
+    await save_last_report_payload(site_id, payload_snapshot)
 
     try:
         await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
@@ -519,6 +542,55 @@ async def send_weekly_report(
             "error": str(exc),
         })
         return {"status": "failed", "week_id": week_id, "report_email": report_email, "error": str(exc)}
+
+
+async def resend_last_report_payload(site_id: str) -> dict:
+    config = app.state.config
+    payload = await get_last_report_payload(site_id)
+    if not payload:
+        return {"status": "failed", "error": "No previously generated report payload found"}
+
+    report_email = payload.get("report_email")
+    subject = payload.get("subject")
+    html_body = payload.get("html_body")
+    text_body = payload.get("text_body")
+    week_id = payload.get("week_id")
+    if not report_email or not subject or not html_body or not text_body:
+        return {"status": "failed", "error": "Stored report payload is incomplete"}
+
+    try:
+        await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
+        await append_delivery_log(site_id, {
+            "status": "sent",
+            "mode": "resend",
+            "week_id": week_id,
+            "report_email": report_email,
+            "generated_at": payload.get("generated_at"),
+        })
+        return {
+            "status": "sent",
+            "mode": "resend",
+            "week_id": week_id,
+            "report_email": report_email,
+            "generated_at": payload.get("generated_at"),
+        }
+    except Exception as exc:
+        await append_delivery_log(site_id, {
+            "status": "failed",
+            "mode": "resend",
+            "week_id": week_id,
+            "report_email": report_email,
+            "generated_at": payload.get("generated_at"),
+            "error": str(exc),
+        })
+        return {
+            "status": "failed",
+            "mode": "resend",
+            "week_id": week_id,
+            "report_email": report_email,
+            "generated_at": payload.get("generated_at"),
+            "error": str(exc),
+        }
 
 
 async def report_scheduler_loop() -> None:
@@ -1318,6 +1390,18 @@ async def send_weekly_test_report(
         "site_id": site_id,
         "result": result,
     }
+
+
+@app.post("/reports/{site_id}/weekly-summary/resend-last")
+async def resend_last_weekly_report(site_id: str, request: Request):
+    await require_site_access(request, site_id)
+    result = await resend_last_report_payload(site_id)
+    status_code = 200 if result.get("status") == "sent" else 400
+    return Response(
+        content=json.dumps({"site_id": site_id, "result": result}),
+        media_type="application/json",
+        status_code=status_code,
+    )
 
 
 @app.get("/stats/{site_id}/contexts")

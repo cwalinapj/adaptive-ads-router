@@ -99,6 +99,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `GET /reports/{site_id}/weekly-summary/html` renders the same summary as a printable client-facing report.
 - `GET /reports/{site_id}/deliveries` returns recent send attempts (`sent` / `failed`) so you can audit automation health.
 - `POST /reports/{site_id}/weekly-summary/send-test` sends a report immediately (optional `email` query override) and appends delivery logs.
+- `POST /reports/{site_id}/weekly-summary/resend-last` resends the exact last generated email payload (no recompute) for reproducible follow-ups.
 
 ## Troubleshooting
 
@@ -118,6 +119,8 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
   - Open `GET /reports/<site_id>/weekly-summary/html?token=<owner_token>` from the dashboard and share or print that page.
 - Need to validate email setup right now:
   - Use the dashboard button `Send test report now` or call `POST /reports/<site_id>/weekly-summary/send-test?token=<owner_token>`.
+- Need to resend the exact last report payload:
+  - Use the dashboard button `Resend last report` or call `POST /reports/<site_id>/weekly-summary/resend-last?token=<owner_token>`.
 - Scheduled emails not arriving:
   - Ensure the site has `report_email` set.
   - Configure `APP_BASE_URL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, and credentials in `.env`.
@@ -154,6 +157,7 @@ GET  /reports/{site_id}/weekly-summary
 GET  /reports/{site_id}/weekly-summary/html
 GET  /reports/{site_id}/deliveries
 POST /reports/{site_id}/weekly-summary/send-test
+POST /reports/{site_id}/weekly-summary/resend-last
 GET  /r/{site_id}
 GET  /convert/{site_id}/{session_id}
 POST /route/{site_id}
