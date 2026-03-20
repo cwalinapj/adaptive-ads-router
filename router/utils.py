@@ -37,6 +37,10 @@ def get_config():
         "smtp_from": os.getenv("SMTP_FROM"),
         "smtp_use_tls": os.getenv("SMTP_USE_TLS", "true").lower() == "true",
         "smtp_use_ssl": os.getenv("SMTP_USE_SSL", "false").lower() == "true",
+        "report_delivery_provider": os.getenv("REPORT_DELIVERY_PROVIDER", "smtp"),
+        "sendgrid_api_key": os.getenv("SENDGRID_API_KEY"),
+        "postmark_server_token": os.getenv("POSTMARK_SERVER_TOKEN"),
+        "report_webhook_secret": os.getenv("REPORT_WEBHOOK_SECRET"),
     }
 
 

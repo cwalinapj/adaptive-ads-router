@@ -726,9 +726,13 @@ content-type: application/json
 
         const deliveryRows = (deliveriesPayload.deliveries || []).map((entry) => {{
           const modeLabel = entry.mode ? `mode=${{entry.mode}}` : "mode=scheduled";
+          const providerLabel = entry.provider ? `provider=${{entry.provider}}` : "provider=-";
+          const providerStatusLabel = entry.provider_status ? `provider_status=${{entry.provider_status}}` : null;
+          const messageLabel = entry.provider_message_id ? `msg=${{entry.provider_message_id}}` : null;
+          const meta = [modeLabel, providerLabel, providerStatusLabel, messageLabel].filter(Boolean).join(" | ");
           const detail = entry.status === "failed"
-            ? `${{modeLabel}} | ${{entry.error || "Send failed"}}`
-            : `${{modeLabel}} | Delivered`;
+            ? `${{meta}} | ${{entry.error || "Send failed"}}`
+            : `${{meta}} | ${{entry.status === "provider_update" ? "Webhook update" : "Delivered"}}`;
           return `
             <tr>
               <td><code>${{entry.timestamp || "-"}}</code></td>

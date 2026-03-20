@@ -102,6 +102,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `POST /reports/{site_id}/weekly-summary/send-test` enqueues a report send immediately (optional `email` query override).
 - `POST /reports/{site_id}/weekly-summary/resend-last` enqueues a resend of the exact last generated email payload (no recompute).
 - `POST /reports/{site_id}/dead-letter/replay` replays a dead-letter job with explicit confirmation (`confirmation="REPLAY <job_id>"`).
+- `POST /webhooks/report-delivery/{provider}` tracks provider lifecycle updates (`accepted`/`delivered`/`bounced`/`complained`) and surfaces them in Delivery Status.
 
 ## Troubleshooting
 
@@ -125,7 +126,8 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
   - Use the dashboard button `Resend last report` or call `POST /reports/<site_id>/weekly-summary/resend-last?token=<owner_token>`.
 - Scheduled emails not arriving:
   - Ensure the site has `report_email` set.
-  - Configure `APP_BASE_URL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, and credentials in `.env`.
+  - Configure `APP_BASE_URL`, `REPORT_DELIVERY_PROVIDER`, and provider credentials in `.env`.
+  - For webhook updates, set `REPORT_WEBHOOK_SECRET` and send it as `X-AAR-Webhook-Secret`.
   - Confirm scheduler window with `REPORT_SEND_WEEKDAY` (`0=Monday`, `4=Friday`) and `REPORT_SEND_HOUR` in `REPORT_TIMEZONE`.
   - Check `GET /reports/<site_id>/deliveries?token=<owner_token>` for the latest failure reason.
   - If retries are exhausted, check Redis dead-letter list `report_jobs:dead`.
@@ -164,6 +166,7 @@ GET  /reports/{site_id}/dead-letter
 POST /reports/{site_id}/weekly-summary/send-test
 POST /reports/{site_id}/weekly-summary/resend-last
 POST /reports/{site_id}/dead-letter/replay
+POST /webhooks/report-delivery/{provider}
 GET  /r/{site_id}
 GET  /convert/{site_id}/{session_id}
 POST /route/{site_id}
@@ -181,6 +184,7 @@ Report delivery uses a durable Redis queue:
 - Queue: `report_jobs:queue`
 - Dead-letter: `report_jobs:dead`
 - Idempotency key: `report_job:idem:{site_id}:{week_id}:{mode}`
+- Provider statuses are appended through webhook callbacks and shown in dashboard Delivery Status.
 
 ## Core Model
 

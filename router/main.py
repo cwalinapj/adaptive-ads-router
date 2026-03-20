@@ -85,6 +85,10 @@ def report_job_idempotency_key(site_id: str, week_id: str, mode: str) -> str:
     return f"report_job:idem:{site_id}:{week_id}:{mode}"
 
 
+def provider_message_key(provider: str, message_id: str) -> str:
+    return f"report_provider_msg:{provider}:{message_id}"
+
+
 def build_default_site_config(site_id: str) -> dict:
     page_a = generate_page_id(site_id, "a")
     page_b = generate_page_id(site_id, "b")
@@ -447,12 +451,27 @@ async def get_last_report_payload(site_id: str) -> Optional[dict]:
     return json.loads(raw) if raw else None
 
 
-def send_report_email(config: dict, to_email: str, subject: str, html_body: str, text_body: str) -> None:
+async def bind_provider_message(site_id: str, provider: str, message_id: Optional[str], metadata: dict) -> None:
+    if not message_id:
+        return
+    payload = {"site_id": site_id, "provider": provider, "message_id": message_id, **metadata}
+    await redis_client.set(
+        provider_message_key(provider, message_id),
+        json.dumps(payload),
+        ex=app.state.config["report_idempotency_ttl_seconds"],
+    )
+
+
+async def lookup_provider_message(provider: str, message_id: str) -> Optional[dict]:
+    raw = await redis_client.get(provider_message_key(provider, message_id))
+    return json.loads(raw) if raw else None
+
+
+def send_email_via_smtp(config: dict, to_email: str, subject: str, html_body: str, text_body: str) -> dict:
     smtp_from = config.get("smtp_from")
     smtp_host = config.get("smtp_host")
     if not smtp_host or not smtp_from:
         raise RuntimeError("SMTP_HOST and SMTP_FROM must be configured")
-
     message = MIMEMultipart("alternative")
     message["Subject"] = subject
     message["From"] = smtp_from
@@ -479,6 +498,116 @@ def send_report_email(config: dict, to_email: str, subject: str, html_body: str,
         if smtp_username:
             server.login(smtp_username, smtp_password or "")
         server.sendmail(smtp_from, [to_email], message.as_string())
+    return {
+        "provider": "smtp",
+        "provider_message_id": f"smtp-{uuid.uuid4().hex}",
+        "provider_status": "accepted",
+    }
+
+
+def send_email_via_sendgrid(config: dict, to_email: str, subject: str, html_body: str, text_body: str) -> dict:
+    api_key = config.get("sendgrid_api_key")
+    smtp_from = config.get("smtp_from")
+    if not api_key or not smtp_from:
+        raise RuntimeError("SENDGRID_API_KEY and SMTP_FROM must be configured")
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": smtp_from},
+        "subject": subject,
+        "content": [
+            {"type": "text/plain", "value": text_body},
+            {"type": "text/html", "value": html_body},
+        ],
+    }
+    with httpx.Client(timeout=20.0) as client:
+        response = client.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+        )
+    if response.status_code >= 300:
+        raise RuntimeError(f"SendGrid send failed: {response.status_code} {response.text[:200]}")
+    return {
+        "provider": "sendgrid",
+        "provider_message_id": response.headers.get("x-message-id") or f"sendgrid-{uuid.uuid4().hex}",
+        "provider_status": "accepted",
+    }
+
+
+def send_email_via_postmark(config: dict, to_email: str, subject: str, html_body: str, text_body: str) -> dict:
+    server_token = config.get("postmark_server_token")
+    smtp_from = config.get("smtp_from")
+    if not server_token or not smtp_from:
+        raise RuntimeError("POSTMARK_SERVER_TOKEN and SMTP_FROM must be configured")
+    payload = {
+        "From": smtp_from,
+        "To": to_email,
+        "Subject": subject,
+        "TextBody": text_body,
+        "HtmlBody": html_body,
+    }
+    with httpx.Client(timeout=20.0) as client:
+        response = client.post(
+            "https://api.postmarkapp.com/email",
+            headers={"Accept": "application/json", "Content-Type": "application/json", "X-Postmark-Server-Token": server_token},
+            json=payload,
+        )
+    if response.status_code >= 300:
+        raise RuntimeError(f"Postmark send failed: {response.status_code} {response.text[:200]}")
+    body = response.json()
+    return {
+        "provider": "postmark",
+        "provider_message_id": body.get("MessageID") or f"postmark-{uuid.uuid4().hex}",
+        "provider_status": "accepted",
+    }
+
+
+def send_report_email(config: dict, to_email: str, subject: str, html_body: str, text_body: str) -> dict:
+    provider = (config.get("report_delivery_provider") or "smtp").lower()
+    if provider == "sendgrid":
+        return send_email_via_sendgrid(config, to_email, subject, html_body, text_body)
+    if provider == "postmark":
+        return send_email_via_postmark(config, to_email, subject, html_body, text_body)
+    if provider != "smtp":
+        raise RuntimeError(f"Unsupported REPORT_DELIVERY_PROVIDER: {provider}")
+    return send_email_via_smtp(config, to_email, subject, html_body, text_body)
+
+
+def map_webhook_event(provider: str, payload: dict) -> tuple[Optional[str], Optional[str]]:
+    if provider == "sendgrid":
+        message_id = payload.get("sg_message_id") or payload.get("smtp-id")
+        event = payload.get("event")
+        if message_id and "." in message_id:
+            message_id = message_id.split(".", 1)[0]
+        if event in {"processed", "deferred"}:
+            return message_id, "accepted"
+        if event == "delivered":
+            return message_id, "delivered"
+        if event in {"bounce", "dropped"}:
+            return message_id, "bounced"
+        if event in {"spamreport"}:
+            return message_id, "complained"
+        return message_id, event
+    if provider == "postmark":
+        message_id = payload.get("MessageID") or payload.get("MessageId")
+        record_type = (payload.get("RecordType") or "").lower()
+        if record_type in {"delivery"}:
+            return message_id, "delivered"
+        if record_type in {"bounce"}:
+            return message_id, "bounced"
+        if record_type in {"spamcomplaint"}:
+            return message_id, "complained"
+        return message_id, record_type or None
+    return None, None
+
+
+def validate_webhook_secret(request: Request) -> None:
+    expected = app.state.config.get("report_webhook_secret")
+    if not expected:
+        return
+    provided = request.headers.get("X-AAR-Webhook-Secret") or request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
 def report_window_is_open(config: dict) -> tuple[bool, str]:
@@ -533,15 +662,31 @@ async def send_weekly_report(
     await save_last_report_payload(site_id, payload_snapshot)
 
     try:
-        await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
+        send_result = await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
         await redis_client.set(report_sent_week_key(site_id), week_id)
+        await bind_provider_message(
+            site_id=site_id,
+            provider=send_result.get("provider", "unknown"),
+            message_id=send_result.get("provider_message_id"),
+            metadata={"week_id": week_id, "report_email": report_email},
+        )
         await append_delivery_log(site_id, {
             "status": "sent",
             "week_id": week_id,
             "report_email": report_email,
             "summary": report["summary"],
+            "provider": send_result.get("provider"),
+            "provider_message_id": send_result.get("provider_message_id"),
+            "provider_status": send_result.get("provider_status"),
         })
-        return {"status": "sent", "week_id": week_id, "report_email": report_email}
+        return {
+            "status": "sent",
+            "week_id": week_id,
+            "report_email": report_email,
+            "provider": send_result.get("provider"),
+            "provider_message_id": send_result.get("provider_message_id"),
+            "provider_status": send_result.get("provider_status"),
+        }
     except Exception as exc:
         await append_delivery_log(site_id, {
             "status": "failed",
@@ -563,13 +708,22 @@ async def resend_report_payload(site_id: str, payload: dict) -> dict:
         return {"status": "failed", "error": "Stored report payload is incomplete"}
 
     try:
-        await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
+        send_result = await asyncio.to_thread(send_report_email, config, report_email, subject, html_body, text_body)
+        await bind_provider_message(
+            site_id=site_id,
+            provider=send_result.get("provider", "unknown"),
+            message_id=send_result.get("provider_message_id"),
+            metadata={"week_id": week_id, "report_email": report_email, "mode": "resend"},
+        )
         await append_delivery_log(site_id, {
             "status": "sent",
             "mode": "resend",
             "week_id": week_id,
             "report_email": report_email,
             "generated_at": payload.get("generated_at"),
+            "provider": send_result.get("provider"),
+            "provider_message_id": send_result.get("provider_message_id"),
+            "provider_status": send_result.get("provider_status"),
         })
         return {
             "status": "sent",
@@ -577,6 +731,9 @@ async def resend_report_payload(site_id: str, payload: dict) -> dict:
             "week_id": week_id,
             "report_email": report_email,
             "generated_at": payload.get("generated_at"),
+            "provider": send_result.get("provider"),
+            "provider_message_id": send_result.get("provider_message_id"),
+            "provider_status": send_result.get("provider_status"),
         }
     except Exception as exc:
         await append_delivery_log(site_id, {
@@ -1639,6 +1796,36 @@ async def replay_dead_letter_report_job(
         "replayed_job_id": body.job_id,
         "result": replay,
     }
+
+
+@app.post("/webhooks/report-delivery/{provider}")
+async def report_delivery_webhook(provider: Literal["sendgrid", "postmark"], request: Request):
+    validate_webhook_secret(request)
+    payload = await request.json()
+    events = payload if isinstance(payload, list) else [payload]
+    updates = 0
+    ignored = 0
+    for event in events:
+        message_id, provider_status = map_webhook_event(provider, event)
+        if not message_id:
+            ignored += 1
+            continue
+        lookup = await lookup_provider_message(provider, message_id)
+        if not lookup:
+            ignored += 1
+            continue
+        await append_delivery_log(lookup["site_id"], {
+            "status": "provider_update",
+            "mode": lookup.get("mode", "scheduled"),
+            "week_id": lookup.get("week_id"),
+            "report_email": lookup.get("report_email"),
+            "provider": provider,
+            "provider_message_id": message_id,
+            "provider_status": provider_status,
+            "provider_event": event.get("event") or event.get("RecordType"),
+        })
+        updates += 1
+    return {"provider": provider, "processed": len(events), "updated": updates, "ignored": ignored}
 
 
 @app.get("/stats/{site_id}/contexts")
