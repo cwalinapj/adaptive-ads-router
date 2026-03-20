@@ -98,8 +98,10 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `GET /reports/{site_id}/weekly-summary` returns a compact weekly JSON summary with top variant, daily trend, recent wins, and recent losses.
 - `GET /reports/{site_id}/weekly-summary/html` renders the same summary as a printable client-facing report.
 - `GET /reports/{site_id}/deliveries` returns recent send attempts (`sent` / `failed`) so you can audit automation health.
+- `GET /reports/{site_id}/dead-letter` returns exhausted report jobs for operator review.
 - `POST /reports/{site_id}/weekly-summary/send-test` enqueues a report send immediately (optional `email` query override).
 - `POST /reports/{site_id}/weekly-summary/resend-last` enqueues a resend of the exact last generated email payload (no recompute).
+- `POST /reports/{site_id}/dead-letter/replay` replays a dead-letter job with explicit confirmation (`confirmation="REPLAY <job_id>"`).
 
 ## Troubleshooting
 
@@ -127,6 +129,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
   - Confirm scheduler window with `REPORT_SEND_WEEKDAY` (`0=Monday`, `4=Friday`) and `REPORT_SEND_HOUR` in `REPORT_TIMEZONE`.
   - Check `GET /reports/<site_id>/deliveries?token=<owner_token>` for the latest failure reason.
   - If retries are exhausted, check Redis dead-letter list `report_jobs:dead`.
+  - Replay safely from dashboard Dead-Letter panel or `POST /reports/<site_id>/dead-letter/replay?token=<owner_token>`.
 - 403 on dashboard or site endpoints:
   - Add the site owner token as `?token=<owner_token>` or send it as `X-AAR-Token: <owner_token>`.
   - For cross-site admin access, set `ADMIN_API_KEY` in `.env` and send that value instead.
@@ -157,8 +160,10 @@ GET  /reports/{site_id}/daily
 GET  /reports/{site_id}/weekly-summary
 GET  /reports/{site_id}/weekly-summary/html
 GET  /reports/{site_id}/deliveries
+GET  /reports/{site_id}/dead-letter
 POST /reports/{site_id}/weekly-summary/send-test
 POST /reports/{site_id}/weekly-summary/resend-last
+POST /reports/{site_id}/dead-letter/replay
 GET  /r/{site_id}
 GET  /convert/{site_id}/{session_id}
 POST /route/{site_id}

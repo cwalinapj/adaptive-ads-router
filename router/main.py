@@ -19,6 +19,7 @@ from typing import Union, Optional, Literal
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pydantic import BaseModel
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -424,6 +425,19 @@ async def get_delivery_logs(site_id: str, limit: int = 20) -> list[dict]:
     return [json.loads(row) for row in rows]
 
 
+async def get_dead_letter_jobs(site_id: str, limit: int = 20) -> list[dict]:
+    # Dead-letter queue is shared; filter by site for safe tenant access.
+    rows = await redis_client.lrange(report_jobs_dead_letter_key(), 0, 499)
+    jobs = []
+    for row in rows:
+        job = json.loads(row)
+        if job.get("site_id") == site_id:
+            jobs.append(job)
+        if len(jobs) >= limit:
+            break
+    return jobs
+
+
 async def save_last_report_payload(site_id: str, payload: dict) -> None:
     await redis_client.set(last_report_payload_key(site_id), json.dumps(payload))
 
@@ -718,6 +732,11 @@ async def process_report_job(job: dict) -> None:
         "attempts": attempts,
         "error": result.get("error"),
     })
+
+
+class ReplayDeadLetterRequest(BaseModel):
+    job_id: str
+    confirmation: str
 
 
 async def report_scheduler_loop() -> None:
@@ -1534,6 +1553,17 @@ async def get_report_deliveries(site_id: str, request: Request, limit: int = 20)
     }
 
 
+@app.get("/reports/{site_id}/dead-letter")
+async def get_dead_letter_report_jobs(site_id: str, request: Request, limit: int = 20):
+    await require_site_access(request, site_id)
+    jobs = await get_dead_letter_jobs(site_id, limit=max(1, min(limit, 100)))
+    return {
+        "site_id": site_id,
+        "count": len(jobs),
+        "jobs": jobs,
+    }
+
+
 @app.post("/reports/{site_id}/weekly-summary/send-test")
 async def send_weekly_test_report(
     site_id: str,
@@ -1570,6 +1600,45 @@ async def resend_last_weekly_report(site_id: str, request: Request):
         payload=last_payload,
     )
     return {"site_id": site_id, "result": result}
+
+
+@app.post("/reports/{site_id}/dead-letter/replay")
+async def replay_dead_letter_report_job(
+    site_id: str,
+    request: Request,
+    body: ReplayDeadLetterRequest,
+):
+    await require_site_access(request, site_id)
+    expected = f"REPLAY {body.job_id}"
+    if body.confirmation.strip() != expected:
+        raise HTTPException(status_code=400, detail=f"Confirmation mismatch. Expected: '{expected}'")
+
+    jobs = await get_dead_letter_jobs(site_id, limit=500)
+    job = next((item for item in jobs if item.get("job_id") == body.job_id), None)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Dead-letter job not found for site")
+
+    replay = await enqueue_report_job(
+        site_id=site_id,
+        mode=job.get("mode", "test"),
+        week_id=job.get("week_id") or current_week_id(app.state.config),
+        source="dead-letter-replay",
+        report_email=job.get("report_email"),
+        payload=job.get("payload"),
+        enforce_idempotency=False,
+    )
+    await append_delivery_log(site_id, {
+        "status": "queued",
+        "mode": "dead-letter-replay",
+        "job_id": body.job_id,
+        "week_id": job.get("week_id"),
+        "report_email": job.get("report_email"),
+    })
+    return {
+        "site_id": site_id,
+        "replayed_job_id": body.job_id,
+        "result": replay,
+    }
 
 
 @app.get("/stats/{site_id}/contexts")

@@ -356,6 +356,26 @@ def render_dashboard(site_id: str) -> str:
         </article>
 
         <article class="card">
+          <h2>Dead-Letter Jobs</h2>
+          <p>Inspect exhausted report jobs and replay with explicit confirmation.</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Job ID</th>
+                <th>Mode</th>
+                <th>Week</th>
+                <th>Attempts</th>
+                <th>Error</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="dead-letter-table">
+              <tr><td colspan="6">Loading dead-letter jobs...</td></tr>
+            </tbody>
+          </table>
+        </article>
+
+        <article class="card">
           <div class="copy-row">
             <div>
               <h2>Recent Events</h2>
@@ -565,19 +585,51 @@ def render_dashboard(site_id: str) -> str:
         }}
       }}
 
+      async function replayDeadLetterJob(jobId) {{
+        const status = document.getElementById("delivery-status");
+        const confirmation = window.prompt(`Type REPLAY ${{jobId}} to confirm replay.`);
+        if (!confirmation) {{
+          status.textContent = "Replay cancelled.";
+          return;
+        }}
+        const url = withToken(`/reports/${{siteId}}/dead-letter/replay`);
+        status.textContent = `Queueing replay for ${{jobId}}...`;
+        try {{
+          const response = await fetch(url, {{
+            method: "POST",
+            headers: {{ "content-type": "application/json" }},
+            body: JSON.stringify({{ job_id: jobId, confirmation }}),
+          }});
+          const payload = await response.json().catch(() => ({{}}));
+          if (!response.ok) {{
+            throw new Error(payload.detail || "Replay request failed.");
+          }}
+          const result = payload.result || {{}};
+          if (result.status === "queued") {{
+            status.textContent = `Queued replay job for dead-letter id ${{jobId}}.`;
+          }} else {{
+            status.textContent = result.reason || result.error || "Replay request completed.";
+          }}
+          await loadDashboard();
+        }} catch (error) {{
+          status.textContent = error.message;
+        }}
+      }}
+
       async function loadDashboard() {{
         const filters = readEventFilters();
         const eventsQuery = buildQuery({{ limit: 12, ...filters }});
         const reportQuery = buildQuery({{ days: 7 }});
-        const [configRes, statsRes, eventsRes, reportRes, deliveriesRes] = await Promise.all([
+        const [configRes, statsRes, eventsRes, reportRes, deliveriesRes, deadRes] = await Promise.all([
           fetch(withToken(`/sites/${{siteId}}`)),
           fetch(withToken(`/stats/${{siteId}}`)),
           fetch(withToken(`/events/${{siteId}}?${{eventsQuery}}`)),
           fetch(withToken(`/reports/${{siteId}}/daily?${{reportQuery}}`)),
           fetch(withToken(`/reports/${{siteId}}/deliveries?limit=10`)),
+          fetch(withToken(`/reports/${{siteId}}/dead-letter?limit=10`)),
         ]);
 
-        if (!configRes.ok || !statsRes.ok || !eventsRes.ok || !reportRes.ok || !deliveriesRes.ok) {{
+        if (!configRes.ok || !statsRes.ok || !eventsRes.ok || !reportRes.ok || !deliveriesRes.ok || !deadRes.ok) {{
           document.getElementById("test-status").textContent =
             accessToken ? "Failed to load dashboard data." : "Management token missing or invalid.";
           document.getElementById("variants-table").innerHTML =
@@ -586,6 +638,8 @@ def render_dashboard(site_id: str) -> str:
             '<tr><td colspan="5">Failed to load recent events.</td></tr>';
           document.getElementById("delivery-table").innerHTML =
             '<tr><td colspan="5">Failed to load delivery logs.</td></tr>';
+          document.getElementById("dead-letter-table").innerHTML =
+            '<tr><td colspan="6">Failed to load dead-letter jobs.</td></tr>';
           return;
         }}
 
@@ -594,6 +648,7 @@ def render_dashboard(site_id: str) -> str:
         const eventsPayload = await eventsRes.json();
         const reportPayload = await reportRes.json();
         const deliveriesPayload = await deliveriesRes.json();
+        const deadPayload = await deadRes.json();
         const statsByPage = Object.fromEntries((stats.arms || []).map((arm) => [arm.page_id, arm]));
 
         document.getElementById("site-name").textContent = config.site_name || siteId;
@@ -686,6 +741,29 @@ content-type: application/json
         }});
         document.getElementById("delivery-table").innerHTML =
           deliveryRows.join("") || '<tr><td colspan="5">No delivery logs yet.</td></tr>';
+
+        const deadRows = (deadPayload.jobs || []).map((job) => {{
+          return `
+            <tr>
+              <td><code>${{job.job_id || "-"}}</code></td>
+              <td>${{job.mode || "-"}}</td>
+              <td><code>${{job.week_id || "-"}}</code></td>
+              <td>${{job.attempts ?? "-"}} / ${{job.max_attempts ?? "-"}}</td>
+              <td>${{job.last_error || "-"}}</td>
+              <td><button class="copy-btn" data-replay-job-id="${{job.job_id || ""}}">Replay</button></td>
+            </tr>
+          `;
+        }});
+        document.getElementById("dead-letter-table").innerHTML =
+          deadRows.join("") || '<tr><td colspan="6">No dead-letter jobs.</td></tr>';
+        document.querySelectorAll("[data-replay-job-id]").forEach((button) => {{
+          const jobId = button.getAttribute("data-replay-job-id");
+          if (!jobId) {{
+            button.disabled = true;
+            return;
+          }}
+          button.addEventListener("click", () => replayDeadLetterJob(jobId));
+        }});
       }}
 
       attachCopyHandlers();
