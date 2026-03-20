@@ -4,6 +4,7 @@ import os
 import uuid
 import json
 from datetime import datetime
+from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 import redis.asyncio as redis
 
 
@@ -42,6 +43,13 @@ def now_iso() -> str:
 
 def get_container_url(site_id: str, page_id: str) -> str:
     return f"http://pages.local/{site_id}/{page_id}"
+
+
+def append_query_params(url: str, params: dict[str, str]) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update({key: value for key, value in params.items() if value is not None})
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def create_tombstone_record(

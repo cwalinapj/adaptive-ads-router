@@ -9,23 +9,27 @@ import os
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Union
+from typing import Union, Optional, Literal
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
 import redis.asyncio as redis
 import httpx
 
 from schemas import (
     RouteRequest, RouteResponse, OutcomeRequest, OutcomeResponse,
     SessionNeuralState, TombstoneRecord,
-    DiffValidationRequest, DiffValidationResponse
+    DiffValidationRequest, DiffValidationResponse,
+    SiteConfigRequest, SiteConfigResponse, SiteSummary, SiteVariant
 )
 from bandit import ThompsonSamplingBandit, ContextualBandit, Context
 from diff_enforcer import RegimeDiffEnforcer, DiffEnforcer
+from dashboard import render_dashboard
 from utils import (
     get_config, generate_session_id, generate_page_id,
-    get_container_url, now_iso, create_tombstone_record, log_event
+    get_container_url, now_iso, create_tombstone_record, log_event,
+    append_query_params
 )
 
 
@@ -35,6 +39,99 @@ BanditType = Union[ThompsonSamplingBandit, ContextualBandit]
 
 # Redis client (global)
 redis_client = None
+
+
+def site_config_key(site_id: str) -> str:
+    return f"site_config:{site_id}"
+
+
+def build_default_site_config(site_id: str) -> dict:
+    page_a = generate_page_id(site_id, "a")
+    page_b = generate_page_id(site_id, "b")
+    return {
+        "site_id": site_id,
+        "site_name": site_id.replace("-", " ").title(),
+        "primary_goal": "lead",
+        "variants": [
+            {
+                "page_id": page_a,
+                "label": "Variant A",
+                "url": get_container_url(site_id, page_a),
+                "notes": "Default control variant"
+            },
+            {
+                "page_id": page_b,
+                "label": "Variant B",
+                "url": get_container_url(site_id, page_b),
+                "notes": "Default challenger variant"
+            }
+        ],
+        "created_at": now_iso(),
+        "updated_at": now_iso()
+    }
+
+
+async def get_site_config(site_id: str) -> dict:
+    data = await redis_client.get(site_config_key(site_id))
+    if data:
+        return json.loads(data)
+
+    config = build_default_site_config(site_id)
+    await redis_client.set(site_config_key(site_id), json.dumps(config))
+    return config
+
+
+async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
+    existing = await redis_client.get(site_config_key(site_id))
+    created_at = json.loads(existing).get("created_at") if existing else now_iso()
+
+    variants = []
+    for idx, variant in enumerate(request.variants):
+        page_id = variant.page_id or generate_page_id(site_id, chr(97 + idx))
+        variants.append({
+            "page_id": page_id,
+            "label": variant.label,
+            "url": variant.url,
+            "notes": variant.notes
+        })
+
+    payload = {
+        "site_id": site_id,
+        "site_name": request.site_name or site_id.replace("-", " ").title(),
+        "primary_goal": request.primary_goal or "lead",
+        "variants": variants,
+        "created_at": created_at,
+        "updated_at": now_iso()
+    }
+    await redis_client.set(site_config_key(site_id), json.dumps(payload))
+    return payload
+
+
+async def list_site_summaries() -> list[dict]:
+    site_ids = set()
+    for pattern in ("site_config:*", "bandit:*"):
+        async for key in redis_client.scan_iter(match=pattern):
+            site_ids.add(key.split(":", 1)[1])
+
+    summaries = []
+    for site_id in sorted(site_ids):
+        config = await get_site_config(site_id)
+        summaries.append({
+            "site_id": site_id,
+            "site_name": config["site_name"],
+            "primary_goal": config["primary_goal"],
+            "variant_count": len(config["variants"]),
+            "created_at": config.get("created_at"),
+            "updated_at": config["updated_at"]
+        })
+    return summaries
+
+
+async def get_assignment(site_id: str, session_id: str) -> dict:
+    raw = await redis_client.get(f"assignment:{site_id}:{session_id}")
+    if not raw:
+        raise HTTPException(status_code=404, detail="Session assignment not found")
+    return json.loads(raw)
 
 
 @asynccontextmanager
@@ -94,17 +191,21 @@ def use_contextual_bandit() -> bool:
 async def get_or_create_bandit(site_id: str) -> BanditType:
     """Get or create bandit for a site. Supports both standard and contextual."""
     config = app.state.config
+    site_config = await get_site_config(site_id)
+    page_ids = [variant["page_id"] for variant in site_config["variants"]]
     key = f"bandit:{site_id}"
     data = await redis_client.get(key)
 
     if data:
         parsed = json.loads(data)
-        # Check if it's a contextual bandit
         if parsed.get("type") == "contextual":
-            return ContextualBandit.from_dict(parsed)
-        return ThompsonSamplingBandit.from_dict(parsed)
+            bandit = ContextualBandit.from_dict(parsed)
+        else:
+            bandit = ThompsonSamplingBandit.from_dict(parsed)
+        bandit.sync_arms(page_ids)
+        await save_bandit(bandit)
+        return bandit
 
-    # Create new bandit based on config
     if use_contextual_bandit():
         bandit = ContextualBandit(
             site_id=site_id,
@@ -112,7 +213,7 @@ async def get_or_create_bandit(site_id: str) -> BanditType:
             neural_threshold=config["neural_threshold"],
             confidence_threshold=config["confidence_threshold"]
         )
-        log_event("bandit_created", {"site_id": site_id, "type": "contextual"})
+        bandit_type = "contextual"
     else:
         bandit = ThompsonSamplingBandit(
             site_id=site_id,
@@ -120,11 +221,11 @@ async def get_or_create_bandit(site_id: str) -> BanditType:
             neural_threshold=config["neural_threshold"],
             confidence_threshold=config["confidence_threshold"]
         )
-        log_event("bandit_created", {"site_id": site_id, "type": "standard"})
+        bandit_type = "standard"
 
-    bandit.add_arm(generate_page_id(site_id, "a"))
-    bandit.add_arm(generate_page_id(site_id, "b"))
+    bandit.sync_arms(page_ids)
     await redis_client.set(key, bandit.to_json())
+    log_event("bandit_created", {"site_id": site_id, "type": bandit_type})
     return bandit
 
 
@@ -150,6 +251,56 @@ def extract_context(request: RouteRequest, http_request: Request = None) -> Cont
     return Context.now(device=device, geo=geo)
 
 
+async def apply_outcome_update(request: OutcomeRequest, background_tasks: Optional[BackgroundTasks] = None) -> OutcomeResponse:
+    bandit = await get_or_create_bandit(request.site_id)
+
+    context = None
+    assignment_data = await redis_client.get(f"assignment:{request.site_id}:{request.session_id}")
+    if assignment_data:
+        assignment = json.loads(assignment_data)
+        if assignment.get("context"):
+            context = Context.from_dict(assignment["context"])
+
+    try:
+        if isinstance(bandit, ContextualBandit):
+            bandit.update(request.page_id, request.converted, context)
+            winner = bandit.get_winner(context)
+            loser = bandit.get_loser(context) if winner else None
+        else:
+            bandit.update(request.page_id, request.converted)
+            winner = bandit.get_winner()
+            loser = bandit.get_loser() if winner else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await save_bandit(bandit)
+
+    response = OutcomeResponse(
+        recorded=True,
+        regime=bandit.regime,
+        winner_declared=winner is not None,
+        winner_page_id=winner[0] if winner else None,
+        should_regenerate=loser is not None,
+        loser_page_id=loser
+    )
+
+    if loser and winner:
+        if background_tasks is not None:
+            background_tasks.add_task(create_tombstone_async, bandit, loser, winner[0], context)
+        else:
+            await create_tombstone_async(bandit, loser, winner[0], context)
+
+    log_event("outcome_recorded", {
+        "site_id": request.site_id,
+        "page_id": request.page_id,
+        "converted": request.converted,
+        "winner_declared": response.winner_declared,
+        "context": context.to_bucket() if context else None
+    })
+
+    return response
+
+
 # =============================================================================
 # ROUTING ENDPOINTS
 # =============================================================================
@@ -159,28 +310,203 @@ async def health():
     return {"status": "healthy", "service": "adaptive-ads-router"}
 
 
-@app.post("/route/{site_id}", response_model=RouteResponse)
-async def route_traffic(site_id: str, request: RouteRequest, http_request: Request):
-    """Route visitor to a page variant using Thompson Sampling (contextual if enabled)."""
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    sites = await list_site_summaries()
+    rows = "".join(
+        f'<li><a href="/dashboard/{site["site_id"]}">{site["site_name"]}</a> '
+        f'({site["variant_count"]} variants)</li>'
+        for site in sites
+    ) or "<li>No sites configured yet. POST /sites/{site_id} to create one.</li>"
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Adaptive Ads Router</title>
+    <style>
+      :root {{
+        --bg: #f7f5ef;
+        --card: #fffdf8;
+        --line: #ddd6c8;
+        --ink: #16202a;
+        --muted: #5a6270;
+        --accent: #0f766e;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{ font-family: sans-serif; margin: 40px auto; max-width: 1100px; padding: 0 20px; background: var(--bg); color: var(--ink); }}
+      section {{ background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 24px; }}
+      .grid {{ display: grid; grid-template-columns: 1.25fr 0.95fr; gap: 18px; }}
+      code, pre {{ font-family: monospace; }}
+      pre {{ background: #f3eee4; padding: 16px; border-radius: 12px; overflow: auto; }}
+      a {{ color: var(--accent); text-decoration: none; }}
+      form {{ display: grid; gap: 12px; margin-top: 18px; }}
+      .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+      label {{ display: grid; gap: 6px; font-size: 14px; color: var(--muted); }}
+      input {{ width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line); background: #fff; color: var(--ink); }}
+      button {{ background: var(--accent); color: #fff; border: 0; border-radius: 10px; padding: 12px 16px; font-weight: 700; cursor: pointer; }}
+      .muted {{ color: var(--muted); }}
+      .status {{ min-height: 24px; color: var(--muted); }}
+      @media (max-width: 900px) {{
+        .grid, .two-col {{ grid-template-columns: 1fr; }}
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="grid">
+      <section>
+        <h1>Adaptive Ads Router MVP</h1>
+        <p>Configure landing page variants, route paid clicks, and record conversions from one service.</p>
+        <p class="muted">Use this form to create your first site, then send ad traffic to <code>/r/&lt;site_id&gt;</code>.</p>
+        <form id="create-site-form">
+          <div class="two-col">
+            <label>
+              Site ID
+              <input id="site-id" name="site_id" placeholder="acme-demo" required />
+            </label>
+            <label>
+              Site name
+              <input id="site-name" name="site_name" placeholder="Acme Demo" required />
+            </label>
+          </div>
+          <label>
+            Primary goal
+            <input id="primary-goal" name="primary_goal" value="lead" />
+          </label>
+          <div class="two-col">
+            <label>
+              Variant A label
+              <input id="variant-a-label" name="variant_a_label" value="Control" required />
+            </label>
+            <label>
+              Variant A URL
+              <input id="variant-a-url" name="variant_a_url" placeholder="https://example.com/landing-a" required />
+            </label>
+          </div>
+          <div class="two-col">
+            <label>
+              Variant B label
+              <input id="variant-b-label" name="variant_b_label" value="Challenger" required />
+            </label>
+            <label>
+              Variant B URL
+              <input id="variant-b-url" name="variant_b_url" placeholder="https://example.com/landing-b" required />
+            </label>
+          </div>
+          <button type="submit">Create site and open dashboard</button>
+          <div class="status" id="form-status"></div>
+        </form>
+      </section>
+      <section>
+        <h2>Configured sites</h2>
+        <ul>{rows}</ul>
+        <h2>API example</h2>
+        <pre>curl -X POST http://localhost:8024/sites/acme-demo \\
+  -H 'content-type: application/json' \\
+  -d '{{
+    "site_name": "Acme Demo",
+    "primary_goal": "lead",
+    "variants": [
+      {{"label": "Control", "url": "https://example.com/landing-a"}},
+      {{"label": "Challenger", "url": "https://example.com/landing-b"}}
+    ]
+  }}'</pre>
+      </section>
+    </div>
+    <script>
+      const form = document.getElementById("create-site-form");
+      const status = document.getElementById("form-status");
+
+      form.addEventListener("submit", async (event) => {{
+        event.preventDefault();
+        status.textContent = "Creating site...";
+
+        const payload = {{
+          site_name: document.getElementById("site-name").value.trim(),
+          primary_goal: document.getElementById("primary-goal").value.trim() || "lead",
+          variants: [
+            {{
+              label: document.getElementById("variant-a-label").value.trim(),
+              url: document.getElementById("variant-a-url").value.trim(),
+            }},
+            {{
+              label: document.getElementById("variant-b-label").value.trim(),
+              url: document.getElementById("variant-b-url").value.trim(),
+            }},
+          ],
+        }};
+
+        const siteId = document.getElementById("site-id").value.trim();
+
+        try {{
+          const response = await fetch(`/sites/${{siteId}}`, {{
+            method: "POST",
+            headers: {{ "content-type": "application/json" }},
+            body: JSON.stringify(payload),
+          }});
+
+          if (!response.ok) {{
+            const data = await response.json().catch(() => ({{ detail: "Failed to create site." }}));
+            throw new Error(data.detail || "Failed to create site.");
+          }}
+
+          window.location.href = `/dashboard/${{siteId}}`;
+        }} catch (error) {{
+          status.textContent = error.message;
+        }}
+      }});
+    </script>
+  </body>
+</html>"""
+
+
+@app.get("/sites", response_model=list[SiteSummary])
+async def list_sites():
+    return await list_site_summaries()
+
+
+@app.post("/sites/{site_id}", response_model=SiteConfigResponse)
+async def configure_site(site_id: str, request: SiteConfigRequest):
+    config = await save_site_config(site_id, request)
     bandit = await get_or_create_bandit(site_id)
+    bandit.sync_arms([variant["page_id"] for variant in config["variants"]])
+    await save_bandit(bandit)
+    return config
 
-    # Extract context for contextual bandit
-    context = extract_context(request, http_request)
 
-    # Select arm based on bandit type
+@app.get("/sites/{site_id}", response_model=SiteConfigResponse)
+async def get_site(site_id: str):
+    return await get_site_config(site_id)
+
+
+@app.get("/dashboard/{site_id}", response_class=HTMLResponse)
+async def dashboard(site_id: str):
+    await get_site_config(site_id)
+    return HTMLResponse(render_dashboard(site_id))
+
+
+async def make_route_decision(
+    site_id: str,
+    request: RouteRequest,
+    http_request: Optional[Request] = None
+) -> RouteResponse:
+    """Shared routing logic for API and redirect flows."""
+    bandit = await get_or_create_bandit(site_id)
+    site_config = await get_site_config(site_id)
+    context = extract_context(request, http_request) if isinstance(bandit, ContextualBandit) else None
+
     if isinstance(bandit, ContextualBandit):
         arm_index, page_id = bandit.select_arm(context)
     else:
         arm_index, page_id = bandit.select_arm()
 
     session_id = generate_session_id()
-
-    # Store session assignment with context
+    variant = next((item for item in site_config["variants"] if item["page_id"] == page_id), None)
     assignment_data = {
         "page_id": page_id,
         "regime": bandit.regime,
         "ts": now_iso(),
-        "context": context.to_dict() if isinstance(bandit, ContextualBandit) else None
+        "context": context.to_dict() if context else None
     }
     await redis_client.setex(
         f"assignment:{site_id}:{session_id}",
@@ -193,18 +519,55 @@ async def route_traffic(site_id: str, request: RouteRequest, http_request: Reque
         "page_id": page_id,
         "regime": bandit.regime,
         "visitor_id": request.visitor_id,
-        "context": context.to_bucket() if isinstance(bandit, ContextualBandit) else None,
+        "context": context.to_bucket() if context else None,
         "contextual": isinstance(bandit, ContextualBandit)
     })
 
     return RouteResponse(
         site_id=site_id,
         page_id=page_id,
-        container_url=get_container_url(site_id, page_id),
+        container_url=variant["url"] if variant else get_container_url(site_id, page_id),
         regime=bandit.regime,
         arm_index=arm_index,
         session_id=session_id
     )
+
+
+@app.post("/route/{site_id}", response_model=RouteResponse)
+async def route_traffic(site_id: str, request: RouteRequest, http_request: Request):
+    """Route visitor to a page variant using Thompson Sampling (contextual if enabled)."""
+    return await make_route_decision(site_id, request, http_request)
+
+
+@app.get("/r/{site_id}")
+async def route_and_redirect(
+    site_id: str,
+    visitor_id: Optional[str] = None,
+    device_type: Literal["mobile", "desktop", "tablet"] = Query(default="desktop"),
+    referrer: Optional[str] = None,
+    utm_source: Optional[str] = None,
+    utm_campaign: Optional[str] = None
+):
+    request = RouteRequest(
+        visitor_id=visitor_id or generate_session_id(),
+        device_type=device_type,
+        referrer=referrer,
+        utm_source=utm_source,
+        utm_campaign=utm_campaign
+    )
+    response = await make_route_decision(site_id, request)
+    site_config = await get_site_config(site_id)
+    variant = next((item for item in site_config["variants"] if item["page_id"] == response.page_id), None)
+    target_url = variant["url"] if variant else response.container_url
+    redirect_url = append_query_params(
+        target_url,
+        {
+            "aar_site_id": response.site_id,
+            "aar_page_id": response.page_id,
+            "aar_session_id": response.session_id,
+        }
+    )
+    return RedirectResponse(url=redirect_url, status_code=307)
 
 
 @app.get("/route/{site_id}")
@@ -241,50 +604,35 @@ async def route_traffic_simple(site_id: str, request: Request, device: str = "de
 @app.post("/outcome", response_model=OutcomeResponse)
 async def record_outcome(request: OutcomeRequest, background_tasks: BackgroundTasks):
     """Record conversion outcome and update bandit."""
-    bandit = await get_or_create_bandit(request.site_id)
+    return await apply_outcome_update(request, background_tasks)
 
-    # Try to retrieve context from session assignment
-    context = None
-    assignment_data = await redis_client.get(f"assignment:{request.site_id}:{request.session_id}")
-    if assignment_data:
-        assignment = json.loads(assignment_data)
-        if assignment.get("context"):
-            context = Context.from_dict(assignment["context"])
 
-    # Update bandit with context if available
-    if isinstance(bandit, ContextualBandit):
-        bandit.update(request.page_id, request.converted, context)
-        winner = bandit.get_winner(context)
-        loser = bandit.get_loser(context) if winner else None
-    else:
-        bandit.update(request.page_id, request.converted)
-        winner = bandit.get_winner()
-        loser = bandit.get_loser() if winner else None
-
-    await save_bandit(bandit)
-
-    response = OutcomeResponse(
-        recorded=True,
-        regime=bandit.regime,
-        winner_declared=winner is not None,
-        winner_page_id=winner[0] if winner else None,
-        should_regenerate=loser is not None,
-        loser_page_id=loser
+@app.get("/convert/{site_id}/{session_id}")
+async def record_conversion(
+    site_id: str,
+    session_id: str,
+    converted: bool = True,
+    revenue: float = 0.0,
+    redirect_to: Optional[str] = None
+):
+    assignment = await get_assignment(site_id, session_id)
+    request = OutcomeRequest(
+        site_id=site_id,
+        page_id=assignment["page_id"],
+        session_id=session_id,
+        converted=converted,
+        revenue=revenue
     )
-
-    # Create tombstone if we have a loser
-    if loser and winner:
-        background_tasks.add_task(create_tombstone_async, bandit, loser, winner[0], context)
-
-    log_event("outcome_recorded", {
-        "site_id": request.site_id,
-        "page_id": request.page_id,
-        "converted": request.converted,
-        "winner_declared": response.winner_declared,
-        "context": context.to_bucket() if context else None
-    })
-
-    return response
+    result = await apply_outcome_update(request)
+    if redirect_to:
+        return RedirectResponse(url=redirect_to, status_code=302)
+    return {
+        "recorded": result.recorded,
+        "site_id": site_id,
+        "page_id": assignment["page_id"],
+        "session_id": session_id,
+        "converted": converted
+    }
 
 
 async def create_tombstone_async(
@@ -325,17 +673,20 @@ async def get_stats(site_id: str, device: str = None, geo: str = None):
     For contextual bandits, optionally filter by device/geo.
     """
     bandit = await get_or_create_bandit(site_id)
-
-    # Build context if filters provided and bandit is contextual
     context = None
     if isinstance(bandit, ContextualBandit) and (device or geo):
         context = Context.now(
             device=device or "desktop",
             geo=geo or "us"
         )
-        return bandit.get_stats(context)
 
-    return bandit.get_stats()
+    stats = bandit.get_stats(context) if context else bandit.get_stats()
+    site_config = await get_site_config(site_id)
+    variants = {variant["page_id"]: variant for variant in site_config["variants"]}
+    for arm in stats["arms"]:
+        arm["label"] = variants.get(arm["page_id"], {}).get("label", arm["page_id"])
+        arm["url"] = variants.get(arm["page_id"], {}).get("url", get_container_url(site_id, arm["page_id"]))
+    return stats
 
 
 @app.get("/stats/{site_id}/contexts")

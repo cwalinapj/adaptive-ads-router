@@ -96,3 +96,34 @@ class DiffValidationResponse(BaseModel):
     max_allowed: float
     violations: List[str] = []
     reason: Optional[str] = None
+
+
+class SiteVariant(BaseModel):
+    page_id: Optional[str] = None
+    label: str
+    url: str
+    notes: Optional[str] = None
+
+
+class SiteConfigRequest(BaseModel):
+    site_name: Optional[str] = None
+    primary_goal: Optional[str] = "lead"
+    variants: List[SiteVariant] = Field(min_length=2)
+
+
+class SiteConfigResponse(BaseModel):
+    site_id: str
+    site_name: str
+    primary_goal: str
+    variants: List[SiteVariant]
+    created_at: Optional[str] = None
+    updated_at: str
+
+
+class SiteSummary(BaseModel):
+    site_id: str
+    site_name: str
+    primary_goal: str
+    variant_count: int
+    created_at: Optional[str] = None
+    updated_at: str

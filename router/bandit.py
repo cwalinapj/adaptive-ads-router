@@ -163,6 +163,12 @@ class Arm:
     @property
     def mean(self) -> float:
         return self.alpha / (self.alpha + self.beta)
+
+    @property
+    def conversion_rate(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return self.conversions / self.total
     
     def sample(self) -> float:
         return np.random.beta(self.alpha, self.beta)
@@ -212,6 +218,11 @@ class ThompsonSamplingBandit:
     
     def add_arm(self, page_id: str):
         self.arms.append(Arm(page_id=page_id))
+
+    def sync_arms(self, page_ids: list[str]):
+        """Make bandit arms match the configured variants while preserving stats."""
+        existing = {arm.page_id: arm for arm in self.arms}
+        self.arms = [existing.get(page_id, Arm(page_id=page_id)) for page_id in page_ids]
     
     def select_arm(self) -> tuple:
         if not self.arms:
@@ -273,7 +284,9 @@ class ThompsonSamplingBandit:
             "total_sessions": self.total_sessions,
             "arms": [
                 {"page_id": arm.page_id, "sessions": arm.total,
-                 "conversions": arm.conversions, "rate": f"{arm.mean:.2%}"}
+                 "conversions": arm.conversions,
+                 "rate": f"{arm.conversion_rate:.2%}",
+                 "posterior_rate": f"{arm.mean:.2%}"}
                 for arm in self.arms
             ],
             "divergence": self.get_divergence(),
@@ -346,6 +359,11 @@ class ContextualBandit:
 
     def add_arm(self, page_id: str):
         self.arms.append(ContextualArm(page_id=page_id))
+
+    def sync_arms(self, page_ids: list[str]):
+        """Make bandit arms match the configured variants while preserving stats."""
+        existing = {arm.page_id: arm for arm in self.arms}
+        self.arms = [existing.get(page_id, ContextualArm(page_id=page_id)) for page_id in page_ids]
 
     def select_arm(self, context: Optional[Context] = None) -> Tuple[int, str]:
         """Select best arm for the given context using Thompson Sampling."""
