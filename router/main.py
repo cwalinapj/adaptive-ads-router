@@ -7,14 +7,16 @@ Contextual bandits learn optimal variants per device/geo/time segment.
 
 import os
 import json
+import csv
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
+from io import StringIO
 from typing import Union, Optional, Literal
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 import redis.asyncio as redis
 import httpx
 
@@ -44,6 +46,10 @@ redis_client = None
 
 def site_config_key(site_id: str) -> str:
     return f"site_config:{site_id}"
+
+
+def site_events_key(site_id: str) -> str:
+    return f"events:{site_id}"
 
 
 def build_default_site_config(site_id: str) -> dict:
@@ -197,6 +203,19 @@ async def get_assignment(site_id: str, session_id: str) -> dict:
     if not raw:
         raise HTTPException(status_code=404, detail="Session assignment not found")
     return json.loads(raw)
+
+
+async def store_site_event(site_id: str, payload: dict) -> None:
+    event = {"timestamp": now_iso(), "site_id": site_id, **payload}
+    retention = app.state.config["event_retention"]
+    key = site_events_key(site_id)
+    await redis_client.lpush(key, json.dumps(event))
+    await redis_client.ltrim(key, 0, retention - 1)
+
+
+async def get_site_events(site_id: str, limit: int = 100) -> list[dict]:
+    rows = await redis_client.lrange(site_events_key(site_id), 0, max(limit - 1, 0))
+    return [json.loads(row) for row in rows]
 
 
 @asynccontextmanager
@@ -354,6 +373,18 @@ async def apply_outcome_update(request: OutcomeRequest, background_tasks: Option
             background_tasks.add_task(create_tombstone_async, bandit, loser, winner[0], context)
         else:
             await create_tombstone_async(bandit, loser, winner[0], context)
+
+    await store_site_event(request.site_id, {
+        "event_type": "outcome",
+        "page_id": request.page_id,
+        "session_id": request.session_id,
+        "converted": request.converted,
+        "revenue": request.revenue,
+        "winner_declared": response.winner_declared,
+        "winner_page_id": response.winner_page_id,
+        "regime": bandit.regime,
+        "context": context.to_bucket() if context else None
+    })
 
     log_event("outcome_recorded", {
         "site_id": request.site_id,
@@ -584,6 +615,7 @@ async def make_route_decision(
         "page_id": page_id,
         "regime": bandit.regime,
         "ts": now_iso(),
+        "visitor_id": request.visitor_id,
         "context": context.to_dict() if context else None
     }
     await redis_client.setex(
@@ -591,6 +623,16 @@ async def make_route_decision(
         3600,
         json.dumps(assignment_data)
     )
+
+    await store_site_event(site_id, {
+        "event_type": "route",
+        "page_id": page_id,
+        "session_id": session_id,
+        "visitor_id": request.visitor_id,
+        "destination_url": variant["url"] if variant else get_container_url(site_id, page_id),
+        "regime": bandit.regime,
+        "context": context.to_bucket() if context else None
+    })
 
     log_event("route_decision", {
         "site_id": site_id,
@@ -769,6 +811,53 @@ async def get_stats(site_id: str, request: Request, device: str = None, geo: str
         arm["label"] = variants.get(arm["page_id"], {}).get("label", arm["page_id"])
         arm["url"] = variants.get(arm["page_id"], {}).get("url", get_container_url(site_id, arm["page_id"]))
     return stats
+
+
+@app.get("/events/{site_id}.csv")
+async def export_events_csv(site_id: str, request: Request, limit: int = 500):
+    await require_site_access(request, site_id)
+    events = await get_site_events(site_id, limit=max(1, min(limit, 5000)))
+    fieldnames = [
+        "timestamp",
+        "event_type",
+        "site_id",
+        "page_id",
+        "session_id",
+        "visitor_id",
+        "destination_url",
+        "converted",
+        "revenue",
+        "winner_declared",
+        "winner_page_id",
+        "regime",
+        "context",
+    ]
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for event in events:
+        row = {key: event.get(key) for key in fieldnames}
+        if isinstance(row.get("context"), dict):
+            row["context"] = json.dumps(row["context"], sort_keys=True)
+        writer.writerow(row)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{site_id}-events.csv"'
+        }
+    )
+
+
+@app.get("/events/{site_id}")
+async def get_events(site_id: str, request: Request, limit: int = 50):
+    await require_site_access(request, site_id)
+    events = await get_site_events(site_id, limit=max(1, min(limit, 500)))
+    return {
+        "site_id": site_id,
+        "count": len(events),
+        "events": events
+    }
 
 
 @app.get("/stats/{site_id}/contexts")

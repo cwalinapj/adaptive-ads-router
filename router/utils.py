@@ -18,6 +18,7 @@ def get_config():
         "confidence_threshold": float(os.getenv("CONFIDENCE_THRESHOLD", "0.95")),
         "min_samples_per_arm": int(os.getenv("MIN_SAMPLES_PER_ARM", "3")),
         "admin_api_key": os.getenv("ADMIN_API_KEY"),
+        "event_retention": int(os.getenv("EVENT_RETENTION", "5000")),
     }
 
 
