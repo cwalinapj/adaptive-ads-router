@@ -155,6 +155,17 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - Compose warning about `version`:
   - If you see an obsolete `version` warning, it is non-blocking for Docker Compose v2.
 
+## Monitoring (Prometheus + Grafana)
+
+- Start app stack first: `docker compose up -d --build`
+- Start monitoring stack: `docker compose -f docker-compose.monitoring.yml up -d`
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000` (default `admin` / `admin`, override with `GRAFANA_ADMIN_USER` + `GRAFANA_ADMIN_PASSWORD`)
+- Prometheus scrapes `GET /ops/metrics/prometheus` using `ADMIN_API_KEY` from `.env`.
+- Included Grafana dashboard: `Adaptive Ads Router - Ops`.
+- Alert rule file: `monitoring/prometheus/alerts.yml`.
+- Alert runbook: [docs/alert-runbook.md](docs/alert-runbook.md)
+
 ## Book A Call / DM
 
 - [Book a call](https://cal.com/cwalinapj/adaptive-ads-router)
