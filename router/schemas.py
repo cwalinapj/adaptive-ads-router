@@ -118,6 +118,8 @@ class SiteConfigResponse(BaseModel):
     variants: List[SiteVariant]
     created_at: Optional[str] = None
     updated_at: str
+    dashboard_url: Optional[str] = None
+    management_token: Optional[str] = None
 
 
 class SiteSummary(BaseModel):

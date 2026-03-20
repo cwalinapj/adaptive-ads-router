@@ -4,6 +4,8 @@ Increase Google Ads lead volume and lower CAC by automatically routing paid traf
 
 This MVP gives you an onboarding form, site configuration API, browser-friendly redirect routing, conversion tracking, and a lightweight dashboard in one service.
 
+Admin surfaces are token-protected: each site gets a private owner token, and you can optionally set `ADMIN_API_KEY` for cross-site admin access.
+
 ## Who This Is For
 
 - Performance marketers and agencies spending $5k+/month on Google Ads
@@ -33,9 +35,10 @@ open http://localhost:8024/
 ## MVP Flow
 
 1. Open `http://localhost:8024/` and create a site with 2 landing page variants.
-2. Send paid traffic to `GET /r/{site_id}` to route each click to the current best variant.
-3. Record conversions with `GET /convert/{site_id}/{session_id}` or `POST /outcome`.
-4. Review variant performance in `GET /dashboard/{site_id}`.
+2. Save the private dashboard URL returned after setup. It includes the site owner token.
+3. Send paid traffic to `GET /r/{site_id}` to route each click to the current best variant.
+4. Record conversions with `GET /convert/{site_id}/{session_id}` or `POST /outcome`.
+5. Review variant performance in `GET /dashboard/{site_id}?token=...`.
 
 ## One-Command Demo (Sample Data)
 
@@ -65,16 +68,17 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 ## What This MVP Includes
 
 - A homepage onboarding form at `GET /` for creating a site without writing JSON by hand.
-- Site configuration endpoints at `POST /sites/{site_id}`, `GET /sites`, and `GET /sites/{site_id}`.
+- Site configuration endpoints at `POST /sites/{site_id}`, `GET /sites`, and `GET /sites/{site_id}` protected by owner token or admin key.
 - Browser-friendly redirect routing at `GET /r/{site_id}` with tracking params appended to the chosen destination URL.
 - Conversion capture at `GET /convert/{site_id}/{session_id}` for thank-you-page or redirect flows.
-- A lightweight operator dashboard at `GET /dashboard/{site_id}`.
+- A lightweight operator dashboard at `GET /dashboard/{site_id}` protected by the site owner token.
 
 ## What You Need To Integrate With Real Google Ads
 
 - Point ad traffic to `GET /r/{site_id}` (or a reverse proxy in front of it) so the router can choose the destination URL per click.
 - Define conversion tracking and call `GET /convert/{site_id}/{session_id}` or `POST /outcome` from your thank-you page, backend event, or pixel/webhook bridge.
 - Configure where variants live by creating a site with labeled destination URLs in the home form or `POST /sites/{site_id}`.
+- Keep the private dashboard URL or owner token returned at site creation. You need it for dashboard, stats, and site management requests.
 - Today’s integration method: keep your existing pages, route the click through Adaptive Ads Router, then let it redirect the visitor to the chosen variant.
 - `GET /r/{site_id}` redirects to the configured variant URL and appends `aar_site_id`, `aar_page_id`, and `aar_session_id`.
 - `POST /route/{site_id}` still returns the selected `page_id`, destination `container_url`, and `session_id` if you prefer a server-to-server flow.
@@ -88,8 +92,11 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
   - Wait 10-30s, then check `curl http://localhost:8024/health`.
   - If still failing, view logs with `docker compose logs router mcp --tail=200`.
 - Site created but no dashboard data:
-  - Open `http://localhost:8024/dashboard/<site_id>` and confirm the site exists with `curl http://localhost:8024/sites/<site_id>`.
+  - Open the private dashboard URL returned at setup and confirm the site exists with `curl "http://localhost:8024/sites/<site_id>?token=<owner_token>"`.
   - Run one routed visit through `/r/<site_id>` and one conversion through `/convert/<site_id>/<session_id>` before expecting stats to move.
+- 403 on dashboard or site endpoints:
+  - Add the site owner token as `?token=<owner_token>` or send it as `X-AAR-Token: <owner_token>`.
+  - For cross-site admin access, set `ADMIN_API_KEY` in `.env` and send that value instead.
 - Debian package fetch flake during build:
   - Dockerfiles already use apt retries/timeouts; rerun `./scripts/demo.sh` and builds should recover from transient download failures.
 - Compose warning about `version`:

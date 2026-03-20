@@ -3,6 +3,7 @@
 import os
 import uuid
 import json
+import secrets
 from datetime import datetime
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
 import redis.asyncio as redis
@@ -16,6 +17,7 @@ def get_config():
         "neural_threshold": int(os.getenv("NEURAL_THRESHOLD", "1000")),
         "confidence_threshold": float(os.getenv("CONFIDENCE_THRESHOLD", "0.95")),
         "min_samples_per_arm": int(os.getenv("MIN_SAMPLES_PER_ARM", "3")),
+        "admin_api_key": os.getenv("ADMIN_API_KEY"),
     }
 
 
@@ -35,6 +37,10 @@ def generate_tombstone_id() -> str:
 def generate_page_id(site_id: str, variant: str = None) -> str:
     variant = variant or uuid.uuid4().hex[:8]
     return f"{site_id}_page_{variant}"
+
+
+def generate_owner_token() -> str:
+    return secrets.token_urlsafe(24)
 
 
 def now_iso() -> str:

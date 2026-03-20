@@ -205,6 +205,14 @@ def render_dashboard(site_id: str) -> str:
           <div class="two-col">
             <div>
               <div class="copy-row">
+                <strong>Management URL</strong>
+                <button class="copy-btn" data-copy-target="dashboard-url">Copy</button>
+              </div>
+              <pre><code id="dashboard-url">Loading management URL...</code></pre>
+              <p class="muted">This private URL includes the site owner token. Treat it like a password.</p>
+            </div>
+            <div>
+              <div class="copy-row">
                 <strong>Ad URL</strong>
                 <button class="copy-btn" data-copy-target="route-url">Copy</button>
               </div>
@@ -263,6 +271,13 @@ def render_dashboard(site_id: str) -> str:
 
     <script>
       const siteId = {site_id!r};
+      const accessToken = new URLSearchParams(window.location.search).get("token") || "";
+
+      function withToken(path) {{
+        if (!accessToken) return path;
+        const separator = path.includes("?") ? "&" : "?";
+        return `${{path}}${{separator}}token=${{encodeURIComponent(accessToken)}}`;
+      }}
 
       function attachCopyHandlers() {{
         document.querySelectorAll("[data-copy-target]").forEach((button) => {{
@@ -335,11 +350,13 @@ def render_dashboard(site_id: str) -> str:
 
       async function loadDashboard() {{
         const [configRes, statsRes] = await Promise.all([
-          fetch(`/sites/${{siteId}}`),
-          fetch(`/stats/${{siteId}}`),
+          fetch(withToken(`/sites/${{siteId}}`)),
+          fetch(withToken(`/stats/${{siteId}}`)),
         ]);
 
         if (!configRes.ok || !statsRes.ok) {{
+          document.getElementById("test-status").textContent =
+            accessToken ? "Failed to load dashboard data." : "Management token missing or invalid.";
           document.getElementById("variants-table").innerHTML =
             '<tr><td colspan="5">Failed to load dashboard data.</td></tr>';
           return;
@@ -368,9 +385,11 @@ def render_dashboard(site_id: str) -> str:
         document.getElementById("variants-table").innerHTML = rows.join("") || '<tr><td colspan="5">No variants configured.</td></tr>';
 
         const origin = window.location.origin;
+        const dashboardUrl = config.dashboard_url || withToken(`${{origin}}/dashboard/${{siteId}}`);
         const routeUrl = `${{origin}}/r/${{siteId}}`;
         const conversionUrl = `${{origin}}/convert/${{siteId}}/<aar_session_id>?converted=true`;
 
+        document.getElementById("dashboard-url").textContent = dashboardUrl;
         document.getElementById("route-url").textContent = routeUrl;
         document.getElementById("conversion-url").textContent = conversionUrl;
         document.getElementById("frontend-snippet").textContent =

@@ -7,6 +7,7 @@ Contextual bandits learn optimal variants per device/geo/time segment.
 
 import os
 import json
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Union, Optional, Literal
@@ -29,7 +30,7 @@ from dashboard import render_dashboard
 from utils import (
     get_config, generate_session_id, generate_page_id,
     get_container_url, now_iso, create_tombstone_record, log_event,
-    append_query_params
+    append_query_params, generate_owner_token
 )
 
 
@@ -52,6 +53,7 @@ def build_default_site_config(site_id: str) -> dict:
         "site_id": site_id,
         "site_name": site_id.replace("-", " ").title(),
         "primary_goal": "lead",
+        "owner_token": generate_owner_token(),
         "variants": [
             {
                 "page_id": page_a,
@@ -81,9 +83,71 @@ async def get_site_config(site_id: str) -> dict:
     return config
 
 
+async def get_existing_site_config(site_id: str) -> Optional[dict]:
+    data = await redis_client.get(site_config_key(site_id))
+    return json.loads(data) if data else None
+
+
+def extract_access_token(request: Request) -> Optional[str]:
+    bearer = request.headers.get("Authorization", "")
+    if bearer.lower().startswith("bearer "):
+        return bearer.split(" ", 1)[1].strip()
+    return (
+        request.headers.get("X-AAR-Token")
+        or request.query_params.get("token")
+    )
+
+
+async def list_owned_site_summaries(access_token: str) -> list[dict]:
+    summaries = []
+    async for key in redis_client.scan_iter(match="site_config:*"):
+        config = json.loads(await redis_client.get(key))
+        if secrets.compare_digest(config.get("owner_token", ""), access_token):
+            summaries.append({
+                "site_id": config["site_id"],
+                "site_name": config["site_name"],
+                "primary_goal": config["primary_goal"],
+                "variant_count": len(config["variants"]),
+                "created_at": config.get("created_at"),
+                "updated_at": config["updated_at"]
+            })
+    return sorted(summaries, key=lambda item: item["site_id"])
+
+
+def attach_management_fields(site_config: dict, request: Request, include_token: bool = False) -> dict:
+    payload = dict(site_config)
+    token = payload.get("owner_token")
+    dashboard_url = None
+    if token:
+        dashboard_url = str(request.url_for("dashboard", site_id=site_config["site_id"])) + f"?token={token}"
+    payload["dashboard_url"] = dashboard_url
+    payload["management_token"] = token if include_token else None
+    payload.pop("owner_token", None)
+    return payload
+
+
+def is_admin_token(token: Optional[str]) -> bool:
+    admin_api_key = app.state.config.get("admin_api_key")
+    return bool(admin_api_key and token and secrets.compare_digest(admin_api_key, token))
+
+
+async def require_site_access(request: Request, site_id: str) -> tuple[dict, bool]:
+    token = extract_access_token(request)
+    existing = await get_existing_site_config(site_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    if is_admin_token(token):
+        return existing, True
+    owner_token = existing.get("owner_token")
+    if token and owner_token and secrets.compare_digest(owner_token, token):
+        return existing, False
+    raise HTTPException(status_code=403, detail="Management token required")
+
+
 async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
-    existing = await redis_client.get(site_config_key(site_id))
-    created_at = json.loads(existing).get("created_at") if existing else now_iso()
+    existing = await get_existing_site_config(site_id)
+    created_at = existing.get("created_at") if existing else now_iso()
+    owner_token = existing.get("owner_token") if existing else generate_owner_token()
 
     variants = []
     for idx, variant in enumerate(request.variants):
@@ -99,6 +163,7 @@ async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
         "site_id": site_id,
         "site_name": request.site_name or site_id.replace("-", " ").title(),
         "primary_goal": request.primary_goal or "lead",
+        "owner_token": owner_token,
         "variants": variants,
         "created_at": created_at,
         "updated_at": now_iso()
@@ -312,12 +377,6 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    sites = await list_site_summaries()
-    rows = "".join(
-        f'<li><a href="/dashboard/{site["site_id"]}">{site["site_name"]}</a> '
-        f'({site["variant_count"]} variants)</li>'
-        for site in sites
-    ) or "<li>No sites configured yet. POST /sites/{site_id} to create one.</li>"
     return f"""<!doctype html>
 <html lang="en">
   <head>
@@ -358,6 +417,7 @@ async def home():
         <h1>Adaptive Ads Router MVP</h1>
         <p>Configure landing page variants, route paid clicks, and record conversions from one service.</p>
         <p class="muted">Use this form to create your first site, then send ad traffic to <code>/r/&lt;site_id&gt;</code>.</p>
+        <p class="muted">A management token is generated for each site. The dashboard link returned after setup is the private management URL.</p>
         <form id="create-site-form">
           <div class="two-col">
             <label>
@@ -398,8 +458,8 @@ async def home():
         </form>
       </section>
       <section>
-        <h2>Configured sites</h2>
-        <ul>{rows}</ul>
+        <h2>Private by Default</h2>
+        <p class="muted">Configured sites, dashboards, and site settings require the site owner token or a global admin API key.</p>
         <h2>API example</h2>
         <pre>curl -X POST http://localhost:8024/sites/acme-demo \\
   -H 'content-type: application/json' \\
@@ -450,7 +510,11 @@ async def home():
             throw new Error(data.detail || "Failed to create site.");
           }}
 
-          window.location.href = `/dashboard/${{siteId}}`;
+          const data = await response.json();
+          if (!data.dashboard_url) {{
+            throw new Error("Site created, but no dashboard URL was returned.");
+          }}
+          window.location.href = data.dashboard_url;
         }} catch (error) {{
           status.textContent = error.message;
         }}
@@ -461,27 +525,38 @@ async def home():
 
 
 @app.get("/sites", response_model=list[SiteSummary])
-async def list_sites():
-    return await list_site_summaries()
+async def list_sites(request: Request):
+    token = extract_access_token(request)
+    if is_admin_token(token):
+        return await list_site_summaries()
+    if token:
+        owned = await list_owned_site_summaries(token)
+        if owned:
+            return owned
+    raise HTTPException(status_code=403, detail="Management token required")
 
 
 @app.post("/sites/{site_id}", response_model=SiteConfigResponse)
-async def configure_site(site_id: str, request: SiteConfigRequest):
+async def configure_site(site_id: str, request: SiteConfigRequest, http_request: Request):
+    existing = await get_existing_site_config(site_id)
+    if existing is not None:
+        await require_site_access(http_request, site_id)
     config = await save_site_config(site_id, request)
     bandit = await get_or_create_bandit(site_id)
     bandit.sync_arms([variant["page_id"] for variant in config["variants"]])
     await save_bandit(bandit)
-    return config
+    return attach_management_fields(config, http_request, include_token=True)
 
 
 @app.get("/sites/{site_id}", response_model=SiteConfigResponse)
-async def get_site(site_id: str):
-    return await get_site_config(site_id)
+async def get_site(site_id: str, request: Request):
+    config, _ = await require_site_access(request, site_id)
+    return attach_management_fields(config, request)
 
 
 @app.get("/dashboard/{site_id}", response_class=HTMLResponse)
-async def dashboard(site_id: str):
-    await get_site_config(site_id)
+async def dashboard(site_id: str, request: Request):
+    await require_site_access(request, site_id)
     return HTMLResponse(render_dashboard(site_id))
 
 
@@ -491,8 +566,11 @@ async def make_route_decision(
     http_request: Optional[Request] = None
 ) -> RouteResponse:
     """Shared routing logic for API and redirect flows."""
+    existing = await get_existing_site_config(site_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Site not found")
     bandit = await get_or_create_bandit(site_id)
-    site_config = await get_site_config(site_id)
+    site_config = existing
     context = extract_context(request, http_request) if isinstance(bandit, ContextualBandit) else None
 
     if isinstance(bandit, ContextualBandit):
@@ -573,6 +651,9 @@ async def route_and_redirect(
 @app.get("/route/{site_id}")
 async def route_traffic_simple(site_id: str, request: Request, device: str = "desktop", geo: str = "us"):
     """Simple GET routing for testing. Pass ?device=mobile&geo=uk for context."""
+    existing = await get_existing_site_config(site_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Site not found")
     bandit = await get_or_create_bandit(site_id)
     session_id = generate_session_id()
 
@@ -667,11 +748,12 @@ async def create_tombstone_async(
 # =============================================================================
 
 @app.get("/stats/{site_id}")
-async def get_stats(site_id: str, device: str = None, geo: str = None):
+async def get_stats(site_id: str, request: Request, device: str = None, geo: str = None):
     """
     Get current bandit stats for a site.
     For contextual bandits, optionally filter by device/geo.
     """
+    await require_site_access(request, site_id)
     bandit = await get_or_create_bandit(site_id)
     context = None
     if isinstance(bandit, ContextualBandit) and (device or geo):
@@ -690,11 +772,12 @@ async def get_stats(site_id: str, device: str = None, geo: str = None):
 
 
 @app.get("/stats/{site_id}/contexts")
-async def get_context_breakdown(site_id: str):
+async def get_context_breakdown(site_id: str, request: Request):
     """
     Get per-context performance breakdown (contextual bandit only).
     Shows which variant wins for each device/geo/time segment.
     """
+    await require_site_access(request, site_id)
     bandit = await get_or_create_bandit(site_id)
 
     if not isinstance(bandit, ContextualBandit):
@@ -717,8 +800,9 @@ async def get_context_breakdown(site_id: str):
 
 
 @app.post("/validate-diff", response_model=DiffValidationResponse)
-async def validate_diff(request: DiffValidationRequest):
+async def validate_diff(request: DiffValidationRequest, http_request: Request):
     """Validate a proposed diff against regime policy."""
+    await require_site_access(http_request, request.site_id)
     bandit = await get_or_create_bandit(request.site_id)
     enforcer = RegimeDiffEnforcer(bandit.regime)
     
@@ -738,8 +822,9 @@ async def validate_diff(request: DiffValidationRequest):
 
 
 @app.get("/allowed-changes/{site_id}")
-async def get_allowed_changes(site_id: str):
+async def get_allowed_changes(site_id: str, request: Request):
     """Get allowed change types for current regime."""
+    await require_site_access(request, site_id)
     bandit = await get_or_create_bandit(site_id)
     enforcer = RegimeDiffEnforcer(bandit.regime)
     
@@ -756,8 +841,9 @@ async def get_allowed_changes(site_id: str):
 # =============================================================================
 
 @app.get("/tombstones/{site_id}")
-async def get_tombstones(site_id: str, limit: int = 10):
+async def get_tombstones(site_id: str, request: Request, limit: int = 10):
     """Get tombstone records for a site."""
+    await require_site_access(request, site_id)
     tombstones = await redis_client.lrange(f"tombstones:{site_id}", -limit, -1)
     return {
         "site_id": site_id,
@@ -767,8 +853,9 @@ async def get_tombstones(site_id: str, limit: int = 10):
 
 
 @app.get("/neural-data/{site_id}")
-async def get_neural_data(site_id: str, limit: int = 100):
+async def get_neural_data(site_id: str, request: Request, limit: int = 100):
     """Get neural session data for training export."""
+    await require_site_access(request, site_id)
     data = await redis_client.lrange(f"neural:{site_id}", -limit, -1)
     return {
         "site_id": site_id,
@@ -782,8 +869,9 @@ async def get_neural_data(site_id: str, limit: int = 100):
 # =============================================================================
 
 @app.post("/reset/{site_id}")
-async def reset_bandit(site_id: str):
+async def reset_bandit(site_id: str, request: Request):
     """Reset bandit for a site (for testing)."""
+    await require_site_access(request, site_id)
     await redis_client.delete(f"bandit:{site_id}")
     return {"reset": True, "site_id": site_id}
 
