@@ -294,6 +294,10 @@ def render_dashboard(site_id: str) -> str:
         <article class="card">
           <h2>Last 7 Days</h2>
           <p>Quick operating summary for the most recent week of tracked activity.</p>
+          <div class="copy-row">
+            <strong>Weekly Client Report</strong>
+            <a id="weekly-report-link" class="copy-btn" href="#" target="_blank" rel="noreferrer">Open weekly report</a>
+          </div>
           <table>
             <thead>
               <tr>
@@ -517,12 +521,14 @@ def render_dashboard(site_id: str) -> str:
         const conversionUrl = `${{origin}}/convert/${{siteId}}/<aar_session_id>?converted=true`;
         const eventsUrl = withToken(`${{origin}}/events/${{siteId}}?${{buildQuery({{ limit: 100, ...filters }})}}`);
         const eventsCsvUrl = withToken(`${{origin}}/events/${{siteId}}.csv?${{buildQuery({{ limit: 1000, ...filters }})}}`);
+        const weeklyReportUrl = withToken(`${{origin}}/reports/${{siteId}}/weekly-summary/html`);
 
         document.getElementById("dashboard-url").textContent = dashboardUrl;
         document.getElementById("route-url").textContent = routeUrl;
         document.getElementById("conversion-url").textContent = conversionUrl;
         document.getElementById("events-url").textContent = eventsUrl;
         document.getElementById("events-csv-link").href = eventsCsvUrl;
+        document.getElementById("weekly-report-link").href = weeklyReportUrl;
         document.getElementById("report-routes").textContent = reportPayload.totals?.routes ?? 0;
         document.getElementById("report-conversions").textContent = reportPayload.totals?.conversions ?? 0;
         document.getElementById("report-rate").textContent = reportPayload.totals?.conversion_rate ?? "0.00%";
@@ -570,5 +576,198 @@ content-type: application/json
       document.getElementById("apply-event-filters").addEventListener("click", loadDashboard);
       loadDashboard();
     </script>
+  </body>
+</html>"""
+
+
+def render_weekly_report(site_config: dict, report: dict, report_url: str, dashboard_url: str) -> str:
+    summary = report["summary"]
+    top_variant = summary.get("top_variant")
+    recent_wins = report.get("recent_wins", [])
+    recent_losses = report.get("recent_losses", [])
+    trend_rows = "".join(
+        f"""
+          <tr>
+            <td>{day['date']}</td>
+            <td>{day['routes']}</td>
+            <td>{day['conversions']}</td>
+            <td>{day['conversion_rate']}</td>
+            <td>{day['revenue']:.2f}</td>
+          </tr>
+        """
+        for day in report.get("daily", [])
+    ) or '<tr><td colspan="5">No activity in this period.</td></tr>'
+    win_rows = "".join(
+        f"<li><code>{event['timestamp']}</code> {event['page_label']} converted session <code>{event['session_id']}</code>.</li>"
+        for event in recent_wins
+    ) or "<li>No conversion wins recorded this week.</li>"
+    loss_rows = "".join(
+        f"<li><code>{event['timestamp']}</code> {event['page_label']} did not convert for session <code>{event['session_id']}</code>.</li>"
+        for event in recent_losses
+    ) or "<li>No non-converting outcomes recorded this week.</li>"
+    top_variant_html = (
+        f"""
+        <div class="callout">
+          <strong>Top Variant:</strong> {top_variant['label']}<br />
+          Routes: {top_variant['routes']}<br />
+          Conversions: {top_variant['conversions']}<br />
+          Conversion rate: {top_variant['conversion_rate']}<br />
+          Revenue: {top_variant['revenue']:.2f}
+        </div>
+        """
+        if top_variant else
+        '<div class="callout"><strong>Top Variant:</strong> Not enough conversion data yet.</div>'
+    )
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{site_config['site_name']} Weekly Report</title>
+    <style>
+      :root {{
+        --bg: #f4efe4;
+        --card: #fffdf8;
+        --ink: #19212a;
+        --muted: #5a6270;
+        --line: #d7d0c3;
+        --accent: #0f766e;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        font-family: "SF Pro Display", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: linear-gradient(180deg, #f8f4ea 0%, var(--bg) 100%);
+      }}
+      main {{
+        width: min(980px, 92vw);
+        margin: 0 auto;
+        padding: 32px 0 48px;
+      }}
+      .hero, .card {{
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        padding: 24px;
+        margin-bottom: 16px;
+      }}
+      .grid {{
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+      }}
+      .metric {{
+        font-size: 2rem;
+        font-weight: 700;
+        margin: 6px 0 0;
+      }}
+      .label {{
+        color: var(--muted);
+        text-transform: uppercase;
+        font-size: 0.8rem;
+        letter-spacing: 0.08em;
+      }}
+      .callout {{
+        margin-top: 16px;
+        padding: 14px;
+        border-radius: 14px;
+        background: #edf7f5;
+        border: 1px solid #c8ebe6;
+      }}
+      table {{
+        width: 100%;
+        border-collapse: collapse;
+      }}
+      th, td {{
+        text-align: left;
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--line);
+      }}
+      ul {{
+        margin: 0;
+        padding-left: 20px;
+      }}
+      a {{
+        color: var(--accent);
+        text-decoration: none;
+      }}
+      .links {{
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+      }}
+      @media print {{
+        body {{ background: #fff; }}
+        .hero, .card {{ box-shadow: none; border-color: #ddd; }}
+      }}
+      @media (max-width: 860px) {{
+        .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <div class="label">Weekly Client Report</div>
+        <h1>{site_config['site_name']}</h1>
+        <p>Reporting window: {report['filters']['start']} through {report['filters']['end']}</p>
+        <div class="links">
+          <a href="{report_url}">JSON summary</a>
+          <a href="{dashboard_url}">Back to dashboard</a>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <div class="label">Routes</div>
+          <p class="metric">{summary['routes']}</p>
+        </article>
+        <article class="card">
+          <div class="label">Conversions</div>
+          <p class="metric">{summary['conversions']}</p>
+        </article>
+        <article class="card">
+          <div class="label">Conversion Rate</div>
+          <p class="metric">{summary['conversion_rate']}</p>
+        </article>
+        <article class="card">
+          <div class="label">Revenue</div>
+          <p class="metric">{summary['revenue']:.2f}</p>
+        </article>
+      </section>
+
+      <section class="card">
+        <h2>Top Variant</h2>
+        {top_variant_html}
+      </section>
+
+      <section class="card">
+        <h2>Daily Trend</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Routes</th>
+              <th>Conversions</th>
+              <th>CVR</th>
+              <th>Revenue</th>
+            </tr>
+          </thead>
+          <tbody>{trend_rows}</tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>Recent Wins</h2>
+        <ul>{win_rows}</ul>
+      </section>
+
+      <section class="card">
+        <h2>Recent Losses</h2>
+        <ul>{loss_rows}</ul>
+      </section>
+    </main>
   </body>
 </html>"""

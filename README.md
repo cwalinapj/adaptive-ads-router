@@ -41,6 +41,7 @@ open http://localhost:8024/
 5. Review variant performance in `GET /dashboard/{site_id}?token=...`.
 6. Inspect raw events at `GET /events/{site_id}?token=...` or export CSV from `GET /events/{site_id}.csv?token=...`.
 7. Pull a last-7-days rollup from `GET /reports/{site_id}/daily?token=...`.
+8. Open the weekly client report at `GET /reports/{site_id}/weekly-summary/html?token=...`.
 
 ## One-Command Demo (Sample Data)
 
@@ -76,6 +77,7 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - A lightweight operator dashboard at `GET /dashboard/{site_id}` protected by the site owner token.
 - Raw route/conversion event export at `GET /events/{site_id}` and `GET /events/{site_id}.csv` protected by the same owner token.
 - Date-filtered event inspection plus a simple daily rollup at `GET /reports/{site_id}/daily`.
+- A downloadable weekly client report at `GET /reports/{site_id}/weekly-summary/html`.
 
 ## What You Need To Integrate With Real Google Ads
 
@@ -90,6 +92,8 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `GET /events/{site_id}` accepts `start=YYYY-MM-DD`, `end=YYYY-MM-DD`, and `type=route|outcome` so operators can filter raw activity before exporting.
 - `GET /events/{site_id}.csv` exports the same filtered feed for spreadsheets.
 - `GET /reports/{site_id}/daily` returns daily route/conversion/revenue totals and defaults to the last 7 days when no explicit range is provided.
+- `GET /reports/{site_id}/weekly-summary` returns a compact weekly JSON summary with top variant, daily trend, recent wins, and recent losses.
+- `GET /reports/{site_id}/weekly-summary/html` renders the same summary as a printable client-facing report.
 
 ## Troubleshooting
 
@@ -105,6 +109,8 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
   - Open `GET /events/<site_id>?token=<owner_token>` for JSON or `GET /events/<site_id>.csv?token=<owner_token>` for a spreadsheet-friendly export.
 - Need a quick last-week summary:
   - Open `GET /reports/<site_id>/daily?token=<owner_token>` or use the dashboard’s `Last 7 Days` card.
+- Need something client-ready:
+  - Open `GET /reports/<site_id>/weekly-summary/html?token=<owner_token>` from the dashboard and share or print that page.
 - 403 on dashboard or site endpoints:
   - Add the site owner token as `?token=<owner_token>` or send it as `X-AAR-Token: <owner_token>`.
   - For cross-site admin access, set `ADMIN_API_KEY` in `.env` and send that value instead.
@@ -132,6 +138,8 @@ GET  /dashboard/{site_id}
 GET  /events/{site_id}
 GET  /events/{site_id}.csv
 GET  /reports/{site_id}/daily
+GET  /reports/{site_id}/weekly-summary
+GET  /reports/{site_id}/weekly-summary/html
 GET  /r/{site_id}
 GET  /convert/{site_id}/{session_id}
 POST /route/{site_id}

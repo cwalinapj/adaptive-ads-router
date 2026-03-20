@@ -28,7 +28,7 @@ from schemas import (
 )
 from bandit import ThompsonSamplingBandit, ContextualBandit, Context
 from diff_enforcer import RegimeDiffEnforcer, DiffEnforcer
-from dashboard import render_dashboard
+from dashboard import render_dashboard, render_weekly_report
 from utils import (
     get_config, generate_session_id, generate_page_id,
     get_container_url, now_iso, create_tombstone_record, log_event,
@@ -289,6 +289,92 @@ def build_daily_report(events: list[dict]) -> list[dict]:
         bucket["conversion_rate"] = f"{((conversions / routes) * 100) if routes else 0:.2f}%"
         results.append(bucket)
     return results
+
+
+def summarize_variant_performance(site_config: dict, events: list[dict]) -> list[dict]:
+    variants = {
+        variant["page_id"]: {
+            "page_id": variant["page_id"],
+            "label": variant["label"],
+            "url": variant["url"],
+            "routes": 0,
+            "outcomes": 0,
+            "conversions": 0,
+            "revenue": 0.0,
+        }
+        for variant in site_config["variants"]
+    }
+    for event in events:
+        page_id = event.get("page_id")
+        if page_id not in variants:
+            continue
+        bucket = variants[page_id]
+        if event.get("event_type") == "route":
+            bucket["routes"] += 1
+        elif event.get("event_type") == "outcome":
+            bucket["outcomes"] += 1
+            if event.get("converted"):
+                bucket["conversions"] += 1
+            bucket["revenue"] += float(event.get("revenue") or 0.0)
+    results = []
+    for bucket in variants.values():
+        routes = bucket["routes"]
+        bucket["conversion_rate"] = f"{((bucket['conversions'] / routes) * 100) if routes else 0:.2f}%"
+        results.append(bucket)
+    return sorted(results, key=lambda item: (item["conversions"], item["routes"], item["revenue"]), reverse=True)
+
+
+def normalize_outcome_events(site_config: dict, events: list[dict], converted: bool) -> list[dict]:
+    labels = {variant["page_id"]: variant["label"] for variant in site_config["variants"]}
+    items = []
+    for event in events:
+        if event.get("event_type") != "outcome" or bool(event.get("converted")) != converted:
+            continue
+        items.append({
+            "timestamp": event["timestamp"],
+            "page_id": event.get("page_id"),
+            "page_label": labels.get(event.get("page_id"), event.get("page_id")),
+            "session_id": event.get("session_id"),
+            "revenue": float(event.get("revenue") or 0.0),
+        })
+    return items[:5]
+
+
+async def build_weekly_summary(
+    site_id: str,
+    site_config: dict,
+    start: Optional[str] = None,
+    end: Optional[str] = None
+) -> dict:
+    if start is None and end is None:
+        end = datetime.now().date().isoformat()
+        start = (datetime.now().date() - timedelta(days=6)).isoformat()
+    events = await filter_site_events(
+        site_id,
+        limit=app.state.config["event_retention"],
+        start=start,
+        end=end,
+    )
+    daily = build_daily_report(events)
+    variants = summarize_variant_performance(site_config, events)
+    summary = {
+        "routes": sum(item["routes"] for item in daily),
+        "outcomes": sum(item["outcomes"] for item in daily),
+        "conversions": sum(item["conversions"] for item in daily),
+        "revenue": round(sum(item["revenue"] for item in daily), 2),
+    }
+    summary["conversion_rate"] = f"{((summary['conversions'] / summary['routes']) * 100) if summary['routes'] else 0:.2f}%"
+    summary["top_variant"] = variants[0] if variants and variants[0]["conversions"] > 0 else None
+    return {
+        "site_id": site_id,
+        "site_name": site_config["site_name"],
+        "filters": {"start": start, "end": end},
+        "summary": summary,
+        "variants": variants,
+        "daily": daily,
+        "recent_wins": normalize_outcome_events(site_config, events, converted=True),
+        "recent_losses": normalize_outcome_events(site_config, events, converted=False),
+    }
 
 
 @asynccontextmanager
@@ -996,6 +1082,36 @@ async def get_daily_report(
         "totals": totals,
         "daily": daily
     }
+
+
+@app.get("/reports/{site_id}/weekly-summary")
+async def get_weekly_summary(
+    site_id: str,
+    request: Request,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    site_config, _ = await require_site_access(request, site_id)
+    return await build_weekly_summary(site_id, site_config, start=start, end=end)
+
+
+@app.get("/reports/{site_id}/weekly-summary/html", response_class=HTMLResponse)
+async def get_weekly_summary_html(
+    site_id: str,
+    request: Request,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    site_config, _ = await require_site_access(request, site_id)
+    report = await build_weekly_summary(site_id, site_config, start=start, end=end)
+    token = extract_access_token(request)
+    origin = str(request.base_url).rstrip("/")
+    dashboard_url = f"{origin}/dashboard/{site_id}"
+    report_url = f"{origin}/reports/{site_id}/weekly-summary"
+    if token:
+        dashboard_url = f"{dashboard_url}?token={token}"
+        report_url = f"{report_url}?token={token}"
+    return HTMLResponse(render_weekly_report(site_config, report, report_url, dashboard_url))
 
 
 @app.get("/stats/{site_id}/contexts")
