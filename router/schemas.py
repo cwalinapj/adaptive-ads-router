@@ -1,6 +1,6 @@
 """Pydantic schemas for the Adaptive Ads Router."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr, HttpUrl
 from typing import Any, Optional, Dict, List, Literal
 
 
@@ -101,14 +101,14 @@ class DiffValidationResponse(BaseModel):
 class SiteVariant(BaseModel):
     page_id: Optional[str] = None
     label: str
-    url: str
+    url: HttpUrl
     notes: Optional[str] = None
 
 
 class SiteConfigRequest(BaseModel):
     site_name: Optional[str] = None
     primary_goal: Optional[str] = "lead"
-    report_email: Optional[str] = None
+    report_email: Optional[EmailStr] = None
     variants: List[SiteVariant] = Field(min_length=2)
 
 
@@ -116,7 +116,7 @@ class SiteConfigResponse(BaseModel):
     site_id: str
     site_name: str
     primary_goal: str
-    report_email: Optional[str] = None
+    report_email: Optional[EmailStr] = None
     variants: List[SiteVariant]
     created_at: Optional[str] = None
     updated_at: str

@@ -20,7 +20,7 @@ from typing import Union, Optional, Literal
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -191,6 +191,78 @@ async def require_site_access(request: Request, site_id: str) -> tuple[dict, boo
     raise HTTPException(status_code=403, detail="Management token required")
 
 
+def sanitize_plain_text(value: str, field_name: str, max_len: int = 160) -> str:
+    cleaned = " ".join((value or "").split()).strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail=f"{field_name} cannot be empty")
+    if len(cleaned) > max_len:
+        raise HTTPException(status_code=400, detail=f"{field_name} exceeds max length {max_len}")
+    if "<" in cleaned or ">" in cleaned:
+        raise HTTPException(status_code=400, detail=f"{field_name} cannot contain angle brackets")
+    return cleaned
+
+
+async def enforce_rate_limit(request: Request, scope: str, limit: int, window_seconds: int, site_id: Optional[str] = None) -> None:
+    token = extract_access_token(request) or ""
+    client_ip = request.client.host if request.client else "unknown"
+    identity = token[:24] if token else client_ip
+    bucket = f"rl:{scope}:{site_id or '-'}:{identity}"
+    if hasattr(redis_client, "incr") and hasattr(redis_client, "expire"):
+        count = await redis_client.incr(bucket)
+        if count == 1:
+            await redis_client.expire(bucket, window_seconds)
+    else:
+        current = await redis_client.get(bucket)
+        if current is None:
+            await redis_client.setex(bucket, window_seconds, "1")
+            return
+        count = int(current) + 1
+        await redis_client.set(bucket, str(count))
+    if count > limit:
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded for {scope}")
+
+
+async def enforce_management_rate_limit(request: Request, site_id: Optional[str] = None) -> None:
+    await enforce_rate_limit(
+        request,
+        scope="management",
+        limit=app.state.config["rate_limit_management_requests"],
+        window_seconds=app.state.config["rate_limit_window_seconds"],
+        site_id=site_id,
+    )
+
+
+async def enforce_report_rate_limit(request: Request, site_id: Optional[str] = None) -> None:
+    await enforce_rate_limit(
+        request,
+        scope="report",
+        limit=app.state.config["rate_limit_report_requests"],
+        window_seconds=app.state.config["rate_limit_window_seconds"],
+        site_id=site_id,
+    )
+
+
+def csrf_key(site_id: str, access_token: str) -> str:
+    digest = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    return f"csrf:{site_id}:{digest}"
+
+
+async def issue_csrf_token(site_id: str, access_token: str) -> str:
+    token = secrets.token_urlsafe(24)
+    await redis_client.setex(csrf_key(site_id, access_token), app.state.config["csrf_token_ttl_seconds"], token)
+    return token
+
+
+async def require_csrf(request: Request, site_id: str) -> None:
+    access_token = extract_access_token(request)
+    if not access_token:
+        raise HTTPException(status_code=403, detail="Management token required")
+    expected = await redis_client.get(csrf_key(site_id, access_token))
+    provided = request.headers.get("X-AAR-CSRF", "")
+    if not expected or not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+
 async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
     existing = await get_existing_site_config(site_id)
     created_at = existing.get("created_at") if existing else now_iso()
@@ -202,16 +274,16 @@ async def save_site_config(site_id: str, request: SiteConfigRequest) -> dict:
         page_id = variant.page_id or generate_page_id(site_id, chr(97 + idx))
         variants.append({
             "page_id": page_id,
-            "label": variant.label,
-            "url": variant.url,
-            "notes": variant.notes
+            "label": sanitize_plain_text(variant.label, "variant label", max_len=80),
+            "url": str(variant.url),
+            "notes": sanitize_plain_text(variant.notes, "variant notes", max_len=200) if variant.notes else None
         })
 
     payload = {
         "site_id": site_id,
-        "site_name": request.site_name or site_id.replace("-", " ").title(),
-        "primary_goal": request.primary_goal or "lead",
-        "report_email": report_email,
+        "site_name": sanitize_plain_text(request.site_name or site_id.replace("-", " ").title(), "site_name", max_len=120),
+        "primary_goal": sanitize_plain_text(request.primary_goal or "lead", "primary_goal", max_len=80),
+        "report_email": str(report_email) if report_email is not None else None,
         "owner_token": owner_token,
         "variants": variants,
         "created_at": created_at,
@@ -1376,6 +1448,7 @@ async def home():
 
 @app.get("/sites", response_model=list[SiteSummary])
 async def list_sites(request: Request):
+    await enforce_management_rate_limit(request)
     token = extract_access_token(request)
     if is_admin_token(token):
         return await list_site_summaries()
@@ -1388,6 +1461,7 @@ async def list_sites(request: Request):
 
 @app.post("/sites/{site_id}", response_model=SiteConfigResponse)
 async def configure_site(site_id: str, request: SiteConfigRequest, http_request: Request):
+    await enforce_management_rate_limit(http_request, site_id=site_id)
     existing = await get_existing_site_config(site_id)
     if existing is not None:
         await require_site_access(http_request, site_id)
@@ -1400,14 +1474,18 @@ async def configure_site(site_id: str, request: SiteConfigRequest, http_request:
 
 @app.get("/sites/{site_id}", response_model=SiteConfigResponse)
 async def get_site(site_id: str, request: Request):
+    await enforce_management_rate_limit(request, site_id=site_id)
     config, _ = await require_site_access(request, site_id)
     return attach_management_fields(config, request)
 
 
 @app.get("/dashboard/{site_id}", response_class=HTMLResponse)
 async def dashboard(site_id: str, request: Request):
+    await enforce_management_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
-    return HTMLResponse(render_dashboard(site_id))
+    access_token = extract_access_token(request)
+    csrf_token = await issue_csrf_token(site_id, access_token or "")
+    return HTMLResponse(render_dashboard(site_id, csrf_token))
 
 
 async def make_route_decision(
@@ -1614,6 +1692,7 @@ async def get_stats(site_id: str, request: Request, device: str = None, geo: str
     Get current bandit stats for a site.
     For contextual bandits, optionally filter by device/geo.
     """
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
     bandit = await get_or_create_bandit(site_id)
     context = None
@@ -1641,6 +1720,7 @@ async def export_events_csv(
     end: Optional[str] = None,
     type: Optional[Literal["route", "outcome"]] = None,
 ):
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
     events = await filter_site_events(
         site_id,
@@ -1690,6 +1770,7 @@ async def get_events(
     end: Optional[str] = None,
     type: Optional[Literal["route", "outcome"]] = None,
 ):
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
     events = await filter_site_events(
         site_id,
@@ -1715,6 +1796,7 @@ async def get_daily_report(
     end: Optional[str] = None,
     type: Optional[Literal["route", "outcome"]] = None,
 ):
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
     if start is None and end is None:
         days = max(1, min(days, 365))
@@ -1751,6 +1833,7 @@ async def get_weekly_summary(
     start: Optional[str] = None,
     end: Optional[str] = None,
 ):
+    await enforce_report_rate_limit(request, site_id=site_id)
     site_config, _ = await require_site_access(request, site_id)
     return await build_weekly_summary(site_id, site_config, start=start, end=end)
 
@@ -1762,6 +1845,7 @@ async def get_weekly_summary_html(
     start: Optional[str] = None,
     end: Optional[str] = None,
 ):
+    await enforce_report_rate_limit(request, site_id=site_id)
     site_config, _ = await require_site_access(request, site_id)
     report = await build_weekly_summary(site_id, site_config, start=start, end=end)
     token = extract_access_token(request)
@@ -1776,6 +1860,7 @@ async def get_weekly_summary_html(
 
 @app.get("/reports/{site_id}/deliveries")
 async def get_report_deliveries(site_id: str, request: Request, limit: int = 20):
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
     deliveries = await get_delivery_logs(site_id, limit=max(1, min(limit, 100)))
     return {
@@ -1787,6 +1872,7 @@ async def get_report_deliveries(site_id: str, request: Request, limit: int = 20)
 
 @app.get("/reports/{site_id}/dead-letter")
 async def get_dead_letter_report_jobs(site_id: str, request: Request, limit: int = 20):
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
     jobs = await get_dead_letter_jobs(site_id, limit=max(1, min(limit, 100)))
     return {
@@ -1800,10 +1886,12 @@ async def get_dead_letter_report_jobs(site_id: str, request: Request, limit: int
 async def send_weekly_test_report(
     site_id: str,
     request: Request,
-    email: Optional[str] = None,
+    email: Optional[EmailStr] = None,
 ):
+    await enforce_report_rate_limit(request, site_id=site_id)
     site_config, _ = await require_site_access(request, site_id)
-    target_email = email or site_config.get("report_email")
+    await require_csrf(request, site_id)
+    target_email = str(email) if email is not None else site_config.get("report_email")
     result = await enqueue_report_job(
         site_id=site_id,
         mode="test",
@@ -1819,7 +1907,9 @@ async def send_weekly_test_report(
 
 @app.post("/reports/{site_id}/weekly-summary/resend-last")
 async def resend_last_weekly_report(site_id: str, request: Request):
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
+    await require_csrf(request, site_id)
     last_payload = await get_last_report_payload(site_id)
     if not last_payload:
         raise HTTPException(status_code=400, detail="No previously generated report payload found")
@@ -1840,7 +1930,9 @@ async def replay_dead_letter_report_job(
     request: Request,
     body: ReplayDeadLetterRequest,
 ):
+    await enforce_report_rate_limit(request, site_id=site_id)
     await require_site_access(request, site_id)
+    await require_csrf(request, site_id)
     expected = f"REPLAY {body.job_id}"
     if body.confirmation.strip() != expected:
         raise HTTPException(status_code=400, detail=f"Confirmation mismatch. Expected: '{expected}'")
@@ -1875,6 +1967,12 @@ async def replay_dead_letter_report_job(
 
 @app.post("/webhooks/report-delivery/{provider}")
 async def report_delivery_webhook(provider: Literal["sendgrid", "postmark"], request: Request):
+    await enforce_rate_limit(
+        request,
+        scope=f"webhook:{provider}",
+        limit=app.state.config["rate_limit_report_requests"],
+        window_seconds=app.state.config["rate_limit_window_seconds"],
+    )
     validate_webhook_secret(request)
     payload = await request.json()
     events = payload if isinstance(payload, list) else [payload]

@@ -1,7 +1,9 @@
 """Simple operator dashboard HTML for the MVP."""
 
+import html
 
-def render_dashboard(site_id: str) -> str:
+
+def render_dashboard(site_id: str, csrf_token: str) -> str:
     return f"""<!doctype html>
 <html lang="en">
   <head>
@@ -432,6 +434,7 @@ def render_dashboard(site_id: str) -> str:
 
     <script>
       const siteId = {site_id!r};
+      const csrfToken = {csrf_token!r};
       const accessToken = new URLSearchParams(window.location.search).get("token") || "";
 
       function withToken(path) {{
@@ -456,6 +459,15 @@ def render_dashboard(site_id: str) -> str:
           }}
         }});
         return query.toString();
+      }}
+
+      function escapeHtml(value) {{
+        return String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
       }}
 
       function attachCopyHandlers() {{
@@ -536,7 +548,7 @@ def render_dashboard(site_id: str) -> str:
         button.disabled = true;
         status.textContent = "Sending test report...";
         try {{
-          const response = await fetch(url, {{ method: "POST" }});
+          const response = await fetch(url, {{ method: "POST", headers: {{ "X-AAR-CSRF": csrfToken }} }});
           const payload = await response.json().catch(() => ({{}}));
           if (!response.ok) {{
             throw new Error(payload.detail || "Failed to send test report.");
@@ -564,7 +576,7 @@ def render_dashboard(site_id: str) -> str:
         button.disabled = true;
         status.textContent = "Resending last payload...";
         try {{
-          const response = await fetch(url, {{ method: "POST" }});
+          const response = await fetch(url, {{ method: "POST", headers: {{ "X-AAR-CSRF": csrfToken }} }});
           const payload = await response.json().catch(() => ({{}}));
           if (!response.ok) {{
             throw new Error(payload?.result?.error || payload.detail || "Failed to queue resend.");
@@ -597,7 +609,7 @@ def render_dashboard(site_id: str) -> str:
         try {{
           const response = await fetch(url, {{
             method: "POST",
-            headers: {{ "content-type": "application/json" }},
+            headers: {{ "content-type": "application/json", "X-AAR-CSRF": csrfToken }},
             body: JSON.stringify({{ job_id: jobId, confirmation }}),
           }});
           const payload = await response.json().catch(() => ({{}}));
@@ -659,11 +671,11 @@ def render_dashboard(site_id: str) -> str:
           const arm = statsByPage[variant.page_id] || {{}};
           return `
             <tr>
-              <td>${{variant.label}}</td>
-              <td><code>${{variant.url}}</code></td>
+              <td>${{escapeHtml(variant.label)}}</td>
+              <td><code>${{escapeHtml(variant.url)}}</code></td>
               <td>${{arm.sessions ?? 0}}</td>
               <td>${{arm.conversions ?? 0}}</td>
-              <td>${{arm.rate ?? "0.00%"}}</td>
+              <td>${{escapeHtml(arm.rate ?? "0.00%")}}</td>
             </tr>
           `;
         }});
@@ -713,11 +725,11 @@ content-type: application/json
             : `converted=${{event.converted ? "true" : "false"}} | winner=${{event.winner_page_id || "-"}}`;
           return `
             <tr>
-              <td><code>${{event.timestamp || "-"}}</code></td>
-              <td>${{event.event_type || "-"}}</td>
-              <td><code>${{event.page_id || "-"}}</code></td>
-              <td><code>${{event.session_id || "-"}}</code></td>
-              <td>${{details}}</td>
+              <td><code>${{escapeHtml(event.timestamp || "-")}}</code></td>
+              <td>${{escapeHtml(event.event_type || "-")}}</td>
+              <td><code>${{escapeHtml(event.page_id || "-")}}</code></td>
+              <td><code>${{escapeHtml(event.session_id || "-")}}</code></td>
+              <td>${{escapeHtml(details)}}</td>
             </tr>
           `;
         }});
@@ -735,11 +747,11 @@ content-type: application/json
             : `${{meta}} | ${{entry.status === "provider_update" ? "Webhook update" : "Delivered"}}`;
           return `
             <tr>
-              <td><code>${{entry.timestamp || "-"}}</code></td>
-              <td>${{entry.status || "-"}}</td>
-              <td><code>${{entry.report_email || "-"}}</code></td>
-              <td><code>${{entry.week_id || "-"}}</code></td>
-              <td>${{detail}}</td>
+              <td><code>${{escapeHtml(entry.timestamp || "-")}}</code></td>
+              <td>${{escapeHtml(entry.status || "-")}}</td>
+              <td><code>${{escapeHtml(entry.report_email || "-")}}</code></td>
+              <td><code>${{escapeHtml(entry.week_id || "-")}}</code></td>
+              <td>${{escapeHtml(detail)}}</td>
             </tr>
           `;
         }});
@@ -749,12 +761,12 @@ content-type: application/json
         const deadRows = (deadPayload.jobs || []).map((job) => {{
           return `
             <tr>
-              <td><code>${{job.job_id || "-"}}</code></td>
-              <td>${{job.mode || "-"}}</td>
-              <td><code>${{job.week_id || "-"}}</code></td>
+              <td><code>${{escapeHtml(job.job_id || "-")}}</code></td>
+              <td>${{escapeHtml(job.mode || "-")}}</td>
+              <td><code>${{escapeHtml(job.week_id || "-")}}</code></td>
               <td>${{job.attempts ?? "-"}} / ${{job.max_attempts ?? "-"}}</td>
-              <td>${{job.last_error || "-"}}</td>
-              <td><button class="copy-btn" data-replay-job-id="${{job.job_id || ""}}">Replay</button></td>
+              <td>${{escapeHtml(job.last_error || "-")}}</td>
+              <td><button class="copy-btn" data-replay-job-id="${{escapeHtml(job.job_id || "")}}">Replay</button></td>
             </tr>
           `;
         }});
@@ -782,6 +794,7 @@ content-type: application/json
 
 
 def render_weekly_report(site_config: dict, report: dict, report_url: str, dashboard_url: str) -> str:
+    esc = lambda value: html.escape(str(value), quote=True)
     summary = report["summary"]
     top_variant = summary.get("top_variant")
     recent_wins = report.get("recent_wins", [])
@@ -789,30 +802,30 @@ def render_weekly_report(site_config: dict, report: dict, report_url: str, dashb
     trend_rows = "".join(
         f"""
           <tr>
-            <td>{day['date']}</td>
+            <td>{esc(day['date'])}</td>
             <td>{day['routes']}</td>
             <td>{day['conversions']}</td>
-            <td>{day['conversion_rate']}</td>
+            <td>{esc(day['conversion_rate'])}</td>
             <td>{day['revenue']:.2f}</td>
           </tr>
         """
         for day in report.get("daily", [])
     ) or '<tr><td colspan="5">No activity in this period.</td></tr>'
     win_rows = "".join(
-        f"<li><code>{event['timestamp']}</code> {event['page_label']} converted session <code>{event['session_id']}</code>.</li>"
+        f"<li><code>{esc(event['timestamp'])}</code> {esc(event['page_label'])} converted session <code>{esc(event['session_id'])}</code>.</li>"
         for event in recent_wins
     ) or "<li>No conversion wins recorded this week.</li>"
     loss_rows = "".join(
-        f"<li><code>{event['timestamp']}</code> {event['page_label']} did not convert for session <code>{event['session_id']}</code>.</li>"
+        f"<li><code>{esc(event['timestamp'])}</code> {esc(event['page_label'])} did not convert for session <code>{esc(event['session_id'])}</code>.</li>"
         for event in recent_losses
     ) or "<li>No non-converting outcomes recorded this week.</li>"
     top_variant_html = (
         f"""
         <div class="callout">
-          <strong>Top Variant:</strong> {top_variant['label']}<br />
+          <strong>Top Variant:</strong> {esc(top_variant['label'])}<br />
           Routes: {top_variant['routes']}<br />
           Conversions: {top_variant['conversions']}<br />
-          Conversion rate: {top_variant['conversion_rate']}<br />
+          Conversion rate: {esc(top_variant['conversion_rate'])}<br />
           Revenue: {top_variant['revenue']:.2f}
         </div>
         """
@@ -824,7 +837,7 @@ def render_weekly_report(site_config: dict, report: dict, report_url: str, dashb
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{site_config['site_name']} Weekly Report</title>
+    <title>{esc(site_config['site_name'])} Weekly Report</title>
     <style>
       :root {{
         --bg: #f4efe4;
@@ -912,11 +925,11 @@ def render_weekly_report(site_config: dict, report: dict, report_url: str, dashb
     <main>
       <section class="hero">
         <div class="label">Weekly Client Report</div>
-        <h1>{site_config['site_name']}</h1>
-        <p>Reporting window: {report['filters']['start']} through {report['filters']['end']}</p>
+        <h1>{esc(site_config['site_name'])}</h1>
+        <p>Reporting window: {esc(report['filters']['start'])} through {esc(report['filters']['end'])}</p>
         <div class="links">
-          <a href="{report_url}">JSON summary</a>
-          <a href="{dashboard_url}">Back to dashboard</a>
+          <a href="{esc(report_url)}">JSON summary</a>
+          <a href="{esc(dashboard_url)}">Back to dashboard</a>
         </div>
       </section>
 

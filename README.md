@@ -104,6 +104,8 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - `POST /reports/{site_id}/weekly-summary/resend-last` enqueues a resend of the exact last generated email payload (no recompute).
 - `POST /reports/{site_id}/dead-letter/replay` replays a dead-letter job with explicit confirmation (`confirmation="REPLAY <job_id>"`).
 - `POST /webhooks/report-delivery/{provider}` tracks provider lifecycle updates (`accepted`/`delivered`/`bounced`/`complained`) and surfaces them in Delivery Status.
+- Dashboard-triggered POST actions require `X-AAR-CSRF` issued by `GET /dashboard/{site_id}`.
+- Management/report endpoints are rate-limited (`RATE_LIMIT_*` env vars).
 
 ## Troubleshooting
 
@@ -136,6 +138,10 @@ Traffic hits the router, the router assigns a variant, conversion events are rec
 - 403 on dashboard or site endpoints:
   - Add the site owner token as `?token=<owner_token>` or send it as `X-AAR-Token: <owner_token>`.
   - For cross-site admin access, set `ADMIN_API_KEY` in `.env` and send that value instead.
+- 403 on report POST actions from custom scripts:
+  - Fetch `GET /dashboard/<site_id>?token=<owner_token>` and send the emitted `csrfToken` as `X-AAR-CSRF`.
+- Frequent 429 responses:
+  - Tune `RATE_LIMIT_WINDOW_SECONDS`, `RATE_LIMIT_MANAGEMENT_REQUESTS`, and `RATE_LIMIT_REPORT_REQUESTS`.
 - Debian package fetch flake during build:
   - Dockerfiles already use apt retries/timeouts; rerun `./scripts/demo.sh` and builds should recover from transient download failures.
 - Compose warning about `version`:

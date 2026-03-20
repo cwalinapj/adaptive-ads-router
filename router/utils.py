@@ -43,6 +43,10 @@ def get_config():
         "sendgrid_api_key": os.getenv("SENDGRID_API_KEY"),
         "postmark_server_token": os.getenv("POSTMARK_SERVER_TOKEN"),
         "report_webhook_secret": os.getenv("REPORT_WEBHOOK_SECRET"),
+        "csrf_token_ttl_seconds": int(os.getenv("CSRF_TOKEN_TTL_SECONDS", "3600")),
+        "rate_limit_window_seconds": int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
+        "rate_limit_management_requests": int(os.getenv("RATE_LIMIT_MANAGEMENT_REQUESTS", "120")),
+        "rate_limit_report_requests": int(os.getenv("RATE_LIMIT_REPORT_REQUESTS", "240")),
     }
 
 
